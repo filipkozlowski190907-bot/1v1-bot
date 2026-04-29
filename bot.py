@@ -277,6 +277,23 @@ async def queue_expand_task():
 @queue_expand_task.before_loop
 async def before_expand(): await bot.wait_until_ready()
 
+@tasks.loop(seconds=5)
+async def ref_board_update_task():
+    all_data = load()
+    for gid, gdata in all_data.items():
+        settings  = gdata.get('settings', {})
+        msg_id    = settings.get('ref_message_id')
+        ch_id     = settings.get('ref_channel_id')
+        if not msg_id or not ch_id: continue
+        try:
+            ch  = await bot.fetch_channel(int(ch_id))
+            msg = await ch.fetch_message(int(msg_id))
+            await msg.edit(embed=build_ref_embed(gdata), view=RefBoardView())
+        except Exception: pass
+
+@ref_board_update_task.before_loop
+async def before_ref_board(): await bot.wait_until_ready()
+
 @tasks.loop(minutes=5)
 async def leaderboard_update_task():
     all_data = load()
@@ -325,6 +342,7 @@ async def on_ready():
     except Exception as e: print(f"❌  Sync failed: {e}")
     queue_expand_task.start()
     leaderboard_update_task.start()
+    ref_board_update_task.start()
     print("✅  Bot ready")
 
 @bot.tree.command(name="register", description="Register to play ranked 1v1s")
@@ -363,12 +381,12 @@ async def cmd_profile(interaction: discord.Interaction, user: discord.Member = N
         if 0 <= banner_idx < len(banners) and banners[banner_idx]:
             embed.set_image(url=banners[banner_idx])
         embed.set_thumbnail(url=target.display_avatar.url)
-        embed.add_field(name="🏅  RANK",    value=f"**{rank_emoji}  {rank_name}**\n{player['elo']} ELO",                    inline=True)
-        embed.add_field(name="🎮  RECORD",  value=f"**{player['wins']}W  /  {player['losses']}L**\n{total} matches  •  {wr}% WR", inline=True)
-        embed.add_field(name="\u200b",      value="\u200b",                                                                   inline=False)
-        embed.add_field(name="🔫  KILLS",   value=f"**{player['kills']}**",                                                   inline=True)
-        embed.add_field(name="💀  DEATHS",  value=f"**{player['deaths']}**",                                                  inline=True)
-        embed.add_field(name="⚡  KDA",     value=f"**{kda}**",                                                               inline=True)
+        embed.add_field(name="🏅  ─── RANK ───",    value=f"{rank_emoji}  **{rank_name}**\n`{player['elo']} ELO`",                    inline=True)
+        embed.add_field(name="🎮  ─── RECORD ───",  value=f"**{player['wins']}W**  /  **{player['losses']}L**\n`{total} matches  •  {wr}% WR`", inline=True)
+        embed.add_field(name="\u200b",               value="\u200b",                                                                        inline=False)
+        embed.add_field(name="🔫  ─── KILLS ───",   value=f"**{player['kills']}**",                                                          inline=True)
+        embed.add_field(name="💀  ─── DEATHS ───",  value=f"**{player['deaths']}**",                                                         inline=True)
+        embed.add_field(name="⚡  ─── KDA ───",     value=f"**{kda}**",                                                                      inline=True)
         embed.set_footer(text=f"Registered  •  {player['registered_at'][:10]}")
         await interaction.response.send_message(embed=embed)
     except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)

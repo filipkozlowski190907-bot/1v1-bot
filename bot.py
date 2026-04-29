@@ -180,9 +180,25 @@ async def on_voice_state_update(member, before, after):
                 in_match = any(m['status'] == 'ongoing' and uid in (m['p1'], m['p2']) for m in gdata.get('matches', []))
                 if not in_match:
                     gdata['queue'] = [q for q in gdata.get('queue', []) if q['uid'] != uid]
+                    # Cancel any pending matches this player is in and re-queue the other player
+                    cancelled = [m for m in gdata.get('pending_matches', []) if uid in (m['p1'], m['p2']) and m['status'] == 'waiting_for_ref']
+                    gdata['pending_matches'] = [m for m in gdata.get('pending_matches', []) if m not in cancelled]
                     save_guild(gid, gdata)
                     try: await member.send(f"❌  You left the **{region}** queue VC and were removed from the queue.")
                     except Exception: pass
+                    for m in cancelled:
+                        other_uid = m['p2'] if uid == m['p1'] else m['p1']
+                        try:
+                            other = member.guild.get_member(int(other_uid)) or await member.guild.fetch_member(int(other_uid))
+                            await other.send(f"❌  Your opponent left so **Match #{m['id']}** has been cancelled. You've been put back in the queue!")
+                            other_player = get_player(gdata, other_uid)
+                            if other_player:
+                                gdata2 = guild_data(gid)
+                                gdata2.setdefault('queue', []).append({'uid': other_uid, 'name': other_player['name'], 'elo': other_player['elo'], 'region': m['region'], 'queued_at': datetime.now(timezone.utc).isoformat()})
+                                save_guild(gid, gdata2)
+                        except Exception: pass
+                    # Update ref board immediately
+                    await update_ref_board(member.guild, guild_data(gid), guild_data(gid).get('settings', {}))
     if after.channel:
         for region, vc_id in q_vcs.items():
             if str(after.channel.id) == str(vc_id):

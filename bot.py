@@ -430,6 +430,57 @@ async def queue_expand_task():
 @queue_expand_task.before_loop
 async def before_expand(): await bot.wait_until_ready()
 
+@tasks.loop(minutes=5)
+async def leaderboard_update_task():
+    all_data = load()
+    for gid, gdata in all_data.items():
+        settings = gdata.get('settings', {})
+        lb_msg_id = settings.get('lb_message_id')
+        lb_ch_id  = settings.get('lb_channel_id')
+        if not lb_msg_id or not lb_ch_id:
+            continue
+        try:
+            ch  = await bot.fetch_channel(int(lb_ch_id))
+            msg = await ch.fetch_message(int(lb_msg_id))
+            await msg.edit(embed=build_leaderboard_embed(gdata))
+        except Exception as e:
+            print(f"[Leaderboard update error] {e}")
+
+@leaderboard_update_task.before_loop
+async def before_lb(): await bot.wait_until_ready()
+
+def build_leaderboard_embed(gdata):
+    players = [(uid, p) for uid, p in gdata.get('players', {}).items() if p['wins'] + p['losses'] > 0]
+    players.sort(key=lambda x: x[1]['elo'], reverse=True)
+    top = players[:10]
+
+    embed = discord.Embed(title="🏆  Ranked Leaderboard  —  Top 10", colour=discord.Colour.gold())
+    medals = ['🥇', '🥈', '🥉']
+
+    if not top:
+        embed.description = "*No ranked players yet — play some matches!*"
+    else:
+        lines = []
+        for i, (uid, p) in enumerate(top):
+            _, rn, re_, _ = get_rank(p['elo'])
+            medal = medals[i] if i < 3 else f"`#{i+1}`"
+            total = p['wins'] + p['losses']
+            wr    = round(p['wins'] / total * 100) if total else 0
+            lines.append(
+                f"{medal}  **{p['name']}**
+"
+                f"┣ {re_} {rn}  •  **{p['elo']} ELO**
+"
+                f"┗ {p['wins']}W  {p['losses']}L  •  {wr}% WR
+"
+            )
+        embed.description = "
+".join(lines)
+
+    embed.set_footer(text=f"Updates every 5 minutes  •  Last updated")
+    embed.timestamp = datetime.now(timezone.utc)
+    return embed
+
 @bot.event
 async def on_ready():
     print(f"\u2705  Logged in as {bot.user}")

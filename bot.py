@@ -66,9 +66,11 @@ def build_ref_embed(gdata):
     embed = discord.Embed(title="🎮  Referee Board", description="Click your region to claim a pending match.\nA match won't start until a ref claims it.", colour=discord.Colour.from_rgb(255, 165, 0))
     for region in REGIONS:
         rp = [m for m in pending if m['region'] == region and m['status'] == 'waiting_for_ref']
-        if rp:
-            m = rp[0]
-            val = f"⚔️ **Match #{m['id']}** needs a ref\n**{m['p1_name']}** vs **{m['p2_name']}**\n*Click to claim!*"
+        count = len(rp)
+        if count == 1:
+            val = f"⚔️  **1 game** needs a ref\n*Click to claim!*"
+        elif count > 1:
+            val = f"⚔️  **{count} games** need a ref\n*Click to claim!*"
         else:
             val = "*No pending matches*"
         embed.add_field(name=f"🌍  {region}", value=val, inline=True)

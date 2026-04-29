@@ -413,9 +413,9 @@ async def queue_expand_task():
                 if guild:
                     try:
                         member = guild.get_member(int(entry['uid'])) or await guild.fetch_member(int(entry['uid']))
+                        region = entry['region']
                         await member.send(
-                            f"⏳  You've been in queue for **3 minutes** with no match in **{entry['region']}**.
-"
+                            f"\u23f3  You've been in queue for **3 minutes** with no match in **{region}**.\n"
                             f"Your search has been expanded to **all regions** to find you a match faster!"
                         )
                     except Exception: pass
@@ -467,15 +467,11 @@ def build_leaderboard_embed(gdata):
             total = p['wins'] + p['losses']
             wr    = round(p['wins'] / total * 100) if total else 0
             lines.append(
-                f"{medal}  **{p['name']}**
-"
-                f"┣ {re_} {rn}  •  **{p['elo']} ELO**
-"
-                f"┗ {p['wins']}W  {p['losses']}L  •  {wr}% WR
-"
+                f"{medal}  **" + p['name'] + "**\n"
+                + f"\u2523 {re_} {rn}  \u2022  **" + str(p['elo']) + " ELO**\n"
+                + f"\u2517 " + str(p['wins']) + "W  " + str(p['losses']) + "L  \u2022  " + str(wr) + "% WR\n"
             )
-        embed.description = "
-".join(lines)
+        embed.description = "\n".join(lines)
 
     embed.set_footer(text=f"Updates every 5 minutes  •  Last updated")
     embed.timestamp = datetime.now(timezone.utc)

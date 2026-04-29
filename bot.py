@@ -709,6 +709,7 @@ async def cmd_active(interaction: discord.Interaction):
 # ── /confirm-result ───────────────────────────────────────────────────────────
 
 @bot.tree.command(name="confirm-result", description="Confirm a match result (Ref only)")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(match_id="Match ID", winner_id="Discord user ID of the winner", p1_score="Player 1 score", p2_score="Player 2 score")
 async def cmd_confirm(interaction: discord.Interaction, match_id: int, winner_id: str, p1_score: int, p2_score: int):
     try:
@@ -791,6 +792,7 @@ async def cmd_confirm(interaction: discord.Interaction, match_id: int, winner_id
 
 @bot.tree.command(name="rollback", description="Roll back last N matches for a player (Admin only)")
 @app_commands.describe(user="Player to roll back", games="Number of recent games to reverse")
+@app_commands.default_permissions(administrator=True)
 async def cmd_rollback(interaction: discord.Interaction, user: discord.Member, games: int):
     try:
         if not interaction.permissions.administrator:
@@ -839,6 +841,7 @@ async def cmd_rollback(interaction: discord.Interaction, user: discord.Member, g
 
 @bot.tree.command(name="adjust-elo", description="Add or remove ELO from a player (Admin only)")
 @app_commands.describe(user="The player", amount="Amount e.g. 50 or -50")
+@app_commands.default_permissions(administrator=True)
 async def cmd_adjust_elo(interaction: discord.Interaction, user: discord.Member, amount: int):
     try:
         if not interaction.permissions.administrator:
@@ -869,6 +872,7 @@ async def cmd_adjust_elo(interaction: discord.Interaction, user: discord.Member,
 # ── Setup commands ────────────────────────────────────────────────────────────
 
 @bot.tree.command(name="setup-queue", description="Set channel where match threads are created — run IN the channel (Admin only)")
+@app_commands.default_permissions(administrator=True)
 async def cmd_setup_queue(interaction: discord.Interaction):
     try:
         if not interaction.permissions.administrator:
@@ -883,6 +887,7 @@ async def cmd_setup_queue(interaction: discord.Interaction):
 
 @bot.tree.command(name="setup-ref-role", description="Set the referee role name (Admin only)")
 @app_commands.describe(role_name="Exact name of the ref role")
+@app_commands.default_permissions(administrator=True)
 async def cmd_setup_ref_role(interaction: discord.Interaction, role_name: str):
     try:
         if not interaction.permissions.administrator:
@@ -898,6 +903,7 @@ async def cmd_setup_ref_role(interaction: discord.Interaction, role_name: str):
 @bot.tree.command(name="setup-region-vc", description="Set a queue VC for a region — join the VC first, then run this (Admin only)")
 @app_commands.describe(region="Region for this VC")
 @app_commands.choices(region=[app_commands.Choice(name=r, value=r) for r in REGIONS])
+@app_commands.default_permissions(administrator=True)
 async def cmd_setup_region_vc(interaction: discord.Interaction, region: str):
     try:
         if not interaction.permissions.administrator:
@@ -914,6 +920,7 @@ async def cmd_setup_region_vc(interaction: discord.Interaction, region: str):
         await interaction.response.send_message(f"\u274c  {e}", ephemeral=True)
 
 @bot.tree.command(name="setup-vc-category", description="Set the category where match VCs are created — run in any channel in that category (Admin only)")
+@app_commands.default_permissions(administrator=True)
 async def cmd_setup_vc_category(interaction: discord.Interaction):
     try:
         if not interaction.permissions.administrator:
@@ -929,6 +936,7 @@ async def cmd_setup_vc_category(interaction: discord.Interaction):
         await interaction.response.send_message(f"\u274c  {e}", ephemeral=True)
 
 @bot.tree.command(name="post-ref-board", description="Post the ref availability board (Admin only)")
+@app_commands.default_permissions(administrator=True)
 async def cmd_post_ref_board(interaction: discord.Interaction):
     try:
         if not interaction.permissions.administrator:
@@ -946,6 +954,7 @@ async def cmd_post_ref_board(interaction: discord.Interaction):
 @bot.tree.command(name="setup-banner", description="Set a profile banner image URL (Admin only)")
 @app_commands.describe(url="Direct image URL for this banner")
 @app_commands.choices(slot=[app_commands.Choice(name=f"{i+1} - {n}", value=i+1) for i, n in enumerate(BANNER_NAMES)])
+@app_commands.default_permissions(administrator=True)
 async def cmd_setup_banner(interaction: discord.Interaction, slot: int, url: str):
     try:
         if not interaction.permissions.administrator:
@@ -966,6 +975,7 @@ async def cmd_setup_banner(interaction: discord.Interaction, slot: int, url: str
 
 @bot.tree.command(name="reset-elo", description="Reset a player's ELO to 500 (Admin only)")
 @app_commands.describe(user="The player to reset")
+@app_commands.default_permissions(administrator=True)
 async def cmd_reset_elo(interaction: discord.Interaction, user: discord.Member):
     try:
         if not interaction.permissions.administrator:
@@ -982,6 +992,7 @@ async def cmd_reset_elo(interaction: discord.Interaction, user: discord.Member):
 
 @bot.tree.command(name="unregister", description="Remove a player from the system (Admin only)")
 @app_commands.describe(user="The player to remove")
+@app_commands.default_permissions(administrator=True)
 async def cmd_unregister(interaction: discord.Interaction, user: discord.Member):
     try:
         if not interaction.permissions.administrator:

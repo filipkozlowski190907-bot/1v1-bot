@@ -458,17 +458,54 @@ async def cmd_profile(interaction: discord.Interaction, user: discord.Member = N
         wr    = round(player['wins'] / total * 100) if total else 0
         kda   = round(player['kills'] / max(1, player['deaths']), 2)
         embed = discord.Embed(title=f"⚔️  {player['name']}'s Player Card", colour=colour)
+        
+        # Add banner image if set
         banners    = gdata.get('settings', {}).get('banners', [])
         banner_idx = player.get('banner', -1)
         if 0 <= banner_idx < len(banners) and banners[banner_idx]:
             embed.set_image(url=banners[banner_idx])
+        
         embed.set_thumbnail(url=target.display_avatar.url)
-        embed.add_field(name="🏅  ─── RANK ───",   value=f"{rank_emoji}  **{rank_name}**\n`{player['elo']} ELO`",                          inline=True)
-        embed.add_field(name="🎮  ─── RECORD ───",  value=f"**{player['wins']}W**  /  **{player['losses']}L**\n`{total} matches  •  {wr}% WR`", inline=True)
-        embed.add_field(name="\u200b",               value="\u200b",                                                                              inline=False)
-        embed.add_field(name="🔫  ─── KILLS ───",   value=f"**{player['kills']}**",                                                             inline=True)
-        embed.add_field(name="💀  ─── DEATHS ───",  value=f"**{player['deaths']}**",                                                            inline=True)
-        embed.add_field(name="⚡  ─── KDA ───",     value=f"**{kda}**",                                                                         inline=True)
+        
+        # RANK section
+        embed.add_field(
+            name="🏅 ─── RANK ───", 
+            value=f"{rank_emoji}  **{rank_name}**\n`{player['elo']} ELO`", 
+            inline=True
+        )
+        
+        # Spacer for better separation between RANK and RECORD
+        embed.add_field(name="\u200b", value="\u200b", inline=True)
+        
+        # RECORD section
+        embed.add_field(
+            name="🎮 ─── RECORD ───", 
+            value=f"**{player['wins']}W** / **{player['losses']}L**\n`{total} matches  •  {wr}% WR`", 
+            inline=True
+        )
+        
+        # Full-width spacer between top and bottom sections
+        embed.add_field(name="\u200b", value="\u200b", inline=False)
+        
+        # KILLS, DEATHS, KDA section
+        embed.add_field(
+            name="🔫 ─── KILLS ───", 
+            value=f"**{player['kills']}**", 
+            inline=True
+        )
+        
+        embed.add_field(
+            name="💀 ─── DEATHS ───", 
+            value=f"**{player['deaths']}**", 
+            inline=True
+        )
+        
+        embed.add_field(
+            name="⚡ ─── KDA ───", 
+            value=f"**{kda}**", 
+            inline=True
+        )
+        
         embed.set_footer(text=f"Registered  •  {player['registered_at'][:10]}")
         await interaction.response.send_message(embed=embed)
     except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)

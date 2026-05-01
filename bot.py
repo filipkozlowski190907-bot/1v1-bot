@@ -3,10 +3,18 @@ from discord.ext import commands, tasks
 from discord import app_commands
 import json
 import os
+import io
+import aiohttp
 from datetime import datetime, timezone
 
-TOKEN     = os.getenv('DISCORD_TOKEN')
-DATA_FILE = 'matchmaking.json'
+TOKEN = os.getenv('DISCORD_TOKEN')
+
+# DATA_DIR lets you point to a persistent volume (e.g. /data on Railway/Render).
+# If unset, data is saved in the bot's working directory.
+_DATA_DIR = os.getenv('DATA_DIR', '.')
+os.makedirs(_DATA_DIR, exist_ok=True)
+DATA_FILE   = os.path.join(_DATA_DIR, 'matchmaking.json')
+BACKUP_FILE = os.path.join(_DATA_DIR, 'matchmaking.backup.json')
 
 RANKS = [
     (0,    'Bronze',   '🥉', discord.Colour.from_rgb(205, 127, 50)),
@@ -37,7 +45,10 @@ def load():
     return {}
 
 def save(data):
-    with open(DATA_FILE, 'w') as f: json.dump(data, f, indent=2)
+    # Write atomically: temp file → rename, so a crash never corrupts the main file
+    tmp = DATA_FILE + '.tmp'
+    with open(tmp, 'w') as f: json.dump(data, f, indent=2)
+    os.replace(tmp, DATA_FILE)
 
 def guild_data(gid):
     d = load()
@@ -394,6 +405,18 @@ async def ref_board_update_task():
 @ref_board_update_task.before_loop
 async def before_ref_board(): await bot.wait_until_ready()
 
+@tasks.loop(hours=1)
+async def backup_task():
+    """Write a timestamped backup of all data every hour."""
+    try:
+        data = load()
+        with open(BACKUP_FILE, 'w') as f: json.dump(data, f, indent=2)
+        print(f"[Backup] Written to {BACKUP_FILE}")
+    except Exception as e: print(f"[Backup error] {e}")
+
+@backup_task.before_loop
+async def before_backup(): await bot.wait_until_ready()
+
 def build_leaderboard_embed(gdata):
     players = [(uid, p) for uid, p in gdata.get('players', {}).items() if p['wins'] + p['losses'] > 0]
     players.sort(key=lambda x: x[1]['elo'], reverse=True)
@@ -418,6 +441,7 @@ def build_leaderboard_embed(gdata):
 @bot.event
 async def on_ready():
     print(f"✅  Logged in as {bot.user}")
+    print(f"📁  Data file: {DATA_FILE}")
     bot.add_view(RefBoardView())
     try:
         synced = await bot.tree.sync()
@@ -426,6 +450,7 @@ async def on_ready():
     queue_expand_task.start()
     leaderboard_update_task.start()
     ref_board_update_task.start()
+    backup_task.start()
     print("✅  Bot ready")
 
 @bot.tree.command(name="register", description="Register to play ranked 1v1s")
@@ -454,59 +479,50 @@ async def cmd_profile(interaction: discord.Interaction, user: discord.Member = N
         if not player:
             await interaction.response.send_message(f"❌  **{target.display_name}** is not registered.", ephemeral=True); return
         _, rank_name, rank_emoji, colour = get_rank(player['elo'])
-        total = player['wins'] + player['losses']
-        wr    = round(player['wins'] / total * 100) if total else 0
-        kda   = round(player['kills'] / max(1, player['deaths']), 2)
+        total  = player['wins'] + player['losses']
+        wr     = round(player['wins'] / total * 100) if total else 0
+        kda    = round(player['kills'] / max(1, player['deaths']), 2)
+        streak = player.get('streak', 0)
+        region = player.get('region', '—')
+
         embed = discord.Embed(title=f"⚔️  {player['name']}'s Player Card", colour=colour)
-        
-        # Add banner image if set
+
+        # Banner image (full-width, shown at bottom)
         banners    = gdata.get('settings', {}).get('banners', [])
         banner_idx = player.get('banner', -1)
         if 0 <= banner_idx < len(banners) and banners[banner_idx]:
             embed.set_image(url=banners[banner_idx])
-        
+
         embed.set_thumbnail(url=target.display_avatar.url)
-        
-        # RANK section
+
+        # ── Row 1: Rank | [spacer] | Record ──────────────────────────────
         embed.add_field(
-            name="🏅 ─── RANK ───", 
-            value=f"{rank_emoji}  **{rank_name}**\n`{player['elo']} ELO`", 
+            name="🏅  Rank",
+            value=f"{rank_emoji} **{rank_name}**\n`{player['elo']} ELO`",
             inline=True
         )
-        
-        # Spacer for better separation between RANK and RECORD
         embed.add_field(name="\u200b", value="\u200b", inline=True)
-        
-        # RECORD section
         embed.add_field(
-            name="🎮 ─── RECORD ───", 
-            value=f"**{player['wins']}W** / **{player['losses']}L**\n`{total} matches  •  {wr}% WR`", 
+            name="📊  Record",
+            value=f"**{player['wins']}W  /  {player['losses']}L**\n`{total} matches  ·  {wr}% WR`",
             inline=True
         )
-        
-        # Full-width spacer between top and bottom sections
-        embed.add_field(name="\u200b", value="\u200b", inline=False)
-        
-        # KILLS, DEATHS, KDA section
-        embed.add_field(
-            name="🔫 ─── KILLS ───", 
-            value=f"**{player['kills']}**", 
-            inline=True
-        )
-        
-        embed.add_field(
-            name="💀 ─── DEATHS ───", 
-            value=f"**{player['deaths']}**", 
-            inline=True
-        )
-        
-        embed.add_field(
-            name="⚡ ─── KDA ───", 
-            value=f"**{kda}**", 
-            inline=True
-        )
-        
-        embed.set_footer(text=f"Registered  •  {player['registered_at'][:10]}")
+
+        # ── Divider ───────────────────────────────────────────────────────
+        embed.add_field(name="─" * 37, value="\u200b", inline=False)
+
+        # ── Row 2: Kills | Deaths | KDA ───────────────────────────────────
+        embed.add_field(name="🔫  Kills",  value=f"**{player['kills']}**",  inline=True)
+        embed.add_field(name="💀  Deaths", value=f"**{player['deaths']}**", inline=True)
+        embed.add_field(name="⚡  KDA",    value=f"**{kda}**",              inline=True)
+
+        # ── Footer ────────────────────────────────────────────────────────
+        try:
+            reg_date = datetime.fromisoformat(player['registered_at']).strftime("%d %b %Y")
+        except Exception:
+            reg_date = player['registered_at'][:10]
+        embed.set_footer(text=f"Registered  ·  {reg_date}")
+        embed.timestamp = datetime.now(timezone.utc)
         await interaction.response.send_message(embed=embed)
     except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
 
@@ -823,6 +839,23 @@ async def cmd_post_leaderboard(interaction: discord.Interaction):
         await interaction.response.send_message("✅  Live leaderboard posted!", ephemeral=True)
     except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
 
+@bot.tree.command(name="setup-banner-storage", description="Set the private channel where banner images are stored permanently (Admin only)")
+@app_commands.default_permissions(administrator=True)
+async def cmd_setup_banner_storage(interaction: discord.Interaction):
+    try:
+        if not interaction.permissions.administrator:
+            await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
+        gid = str(interaction.guild_id)
+        gdata = guild_data(gid)
+        gdata.setdefault('settings', {})['banner_storage_channel_id'] = str(interaction.channel_id)
+        save_guild(gid, gdata)
+        await interaction.response.send_message(
+            f"✅  Banner images will be stored in <#{interaction.channel_id}>.\n"
+            f"💡  Keep this channel **private** — it just holds the image files so they survive redeployments.",
+            ephemeral=True
+        )
+    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
+
 @bot.tree.command(name="setup-banner", description="Set a profile banner by uploading an image (Admin only)")
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(image="Upload the banner image directly")
@@ -833,15 +866,48 @@ async def cmd_setup_banner(interaction: discord.Interaction, slot: int, image: d
             await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
         if not image.content_type or not image.content_type.startswith('image/'):
             await interaction.response.send_message("❌  Please upload an image file.", ephemeral=True); return
+        await interaction.response.defer(ephemeral=True)
         gid   = str(interaction.guild_id)
         gdata = guild_data(gid)
         banners = gdata.setdefault('settings', {}).setdefault('banners', [''] * 6)
         while len(banners) < 6: banners.append('')
+
+        # Re-upload to the permanent storage channel so the URL survives redeployments.
+        storage_ch_id = gdata.get('settings', {}).get('banner_storage_channel_id')
+        if storage_ch_id:
+            try:
+                storage_ch = await bot.fetch_channel(int(storage_ch_id))
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(image.url) as resp:
+                        img_bytes = await resp.read()
+                ext = image.filename.rsplit('.', 1)[-1] if '.' in image.filename else 'png'
+                file = discord.File(io.BytesIO(img_bytes), filename=f"banner_{slot}.{ext}")
+                stored_msg = await storage_ch.send(
+                    content=f"🖼️  Banner slot {slot} — **{BANNER_NAMES[slot-1]}**",
+                    file=file
+                )
+                permanent_url = stored_msg.attachments[0].url
+                banners[slot - 1] = permanent_url
+                gdata['settings']['banners'] = banners
+                save_guild(gid, gdata)
+                await interaction.followup.send(
+                    f"✅  Banner **{BANNER_NAMES[slot-1]}** saved permanently to <#{storage_ch_id}>!", ephemeral=True
+                )
+                return
+            except Exception as e:
+                print(f"[Banner storage error] {e}")
+                # Fall through to saving the raw URL with a warning
+
+        # No storage channel set — save the raw CDN URL (may expire on redeploy)
         banners[slot - 1] = image.url
         gdata['settings']['banners'] = banners
         save_guild(gid, gdata)
-        await interaction.response.send_message(f"✅  Banner **{BANNER_NAMES[slot-1]}** set!", ephemeral=True)
-    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
+        await interaction.followup.send(
+            f"✅  Banner **{BANNER_NAMES[slot-1]}** set!\n"
+            f"⚠️  Run `/setup-banner-storage` in a private channel first so banners survive redeployments.",
+            ephemeral=True
+        )
+    except Exception as e: await interaction.followup.send(f"❌  {e}", ephemeral=True)
 
 @bot.tree.command(name="reset-elo", description="Reset a player's ELO to 500 (Admin only)")
 @app_commands.default_permissions(administrator=True)

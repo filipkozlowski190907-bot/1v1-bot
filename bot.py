@@ -498,13 +498,13 @@ async def cmd_profile(interaction: discord.Interaction, user: discord.Member = N
         # ── Row 1: Rank | [spacer] | Record ──────────────────────────────
         embed.add_field(
             name="🏅  Rank",
-            value=f"{rank_emoji} **{rank_name}**\n`{player['elo']} ELO`",
+            value=f"{rank_emoji} **{rank_name}**\n`{player['elo']} ELO`\n\u200b",
             inline=True
         )
         embed.add_field(name="\u200b", value="\u200b", inline=True)
         embed.add_field(
             name="📊  Record",
-            value=f"**{player['wins']}W  /  {player['losses']}L**\n`{total} matches  ·  {wr}% WR`",
+            value=f"**{player['wins']}W  /  {player['losses']}L**\n`{total} matches  ·  {wr}% WR`\n\u200b",
             inline=True
         )
 
@@ -512,9 +512,9 @@ async def cmd_profile(interaction: discord.Interaction, user: discord.Member = N
         embed.add_field(name="─" * 37, value="\u200b", inline=False)
 
         # ── Row 2: Kills | Deaths | KDA ───────────────────────────────────
-        embed.add_field(name="🔫  Kills",  value=f"**{player['kills']}**",  inline=True)
-        embed.add_field(name="💀  Deaths", value=f"**{player['deaths']}**", inline=True)
-        embed.add_field(name="⚡  KDA",    value=f"**{kda}**",              inline=True)
+        embed.add_field(name="🔫  Kills",  value=f"**{player['kills']}**\n\u200b",  inline=True)
+        embed.add_field(name="💀  Deaths", value=f"**{player['deaths']}**\n\u200b", inline=True)
+        embed.add_field(name="⚡  KDA",    value=f"**{kda}**\n\u200b",              inline=True)
 
         # ── Footer ────────────────────────────────────────────────────────
         try:

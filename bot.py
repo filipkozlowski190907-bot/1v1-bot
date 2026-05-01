@@ -7,14 +7,17 @@ import io
 import aiohttp
 from datetime import datetime, timezone
 
-TOKEN = os.getenv('DISCORD_TOKEN')
+TOKEN     = os.getenv('DISCORD_TOKEN')
+DATA_FILE = 'matchmaking.json'   # local cache — rebuilt from Discord on every startup
 
-# DATA_DIR lets you point to a persistent volume (e.g. /data on Railway/Render).
-# If unset, data is saved in the bot's working directory.
-_DATA_DIR = os.getenv('DATA_DIR', '.')
-os.makedirs(_DATA_DIR, exist_ok=True)
-DATA_FILE   = os.path.join(_DATA_DIR, 'matchmaking.json')
-BACKUP_FILE = os.path.join(_DATA_DIR, 'matchmaking.backup.json')
+# ─── Discord-backed persistence ───────────────────────────────────────────────
+# The bot uploads the full JSON to a private Discord channel after every save.
+# On startup it downloads it back, so data survives redeployments completely.
+#
+# Setup: run /setup-data-channel inside a private channel once.
+# Optionally set DATA_CHANNEL_ID as an env var to skip the command.
+# ─────────────────────────────────────────────────────────────────────────────
+_DATA_CHANNEL_ID = os.getenv('DATA_CHANNEL_ID', '')   # optional env-var shortcut
 
 RANKS = [
     (0,    'Bronze',   '🥉', discord.Colour.from_rgb(205, 127, 50)),
@@ -45,20 +48,74 @@ def load():
     return {}
 
 def save(data):
-    # Write atomically: temp file → rename, so a crash never corrupts the main file
     tmp = DATA_FILE + '.tmp'
     with open(tmp, 'w') as f: json.dump(data, f, indent=2)
     os.replace(tmp, DATA_FILE)
+
+def _get_data_channel_id():
+    """Return the data-channel ID from env var or any guild's settings."""
+    if _DATA_CHANNEL_ID: return _DATA_CHANNEL_ID
+    try:
+        for gdata in load().values():
+            cid = gdata.get('settings', {}).get('data_channel_id')
+            if cid: return cid
+    except Exception: pass
+    return None
+
+async def push_to_discord():
+    """Upload the current JSON to the data channel so it survives redeploys."""
+    ch_id = _get_data_channel_id()
+    if not ch_id: return
+    try:
+        ch      = await bot.fetch_channel(int(ch_id))
+        content = json.dumps(load(), indent=2).encode()
+        file    = discord.File(io.BytesIO(content), filename='matchmaking.json')
+        # Edit the last bot message if there is one, otherwise post a new one
+        async for msg in ch.history(limit=20):
+            if msg.author == bot.user and msg.attachments:
+                await msg.edit(content="📦 **Bot data — do not delete**", attachments=[file])
+                return
+        await ch.send(content="📦 **Bot data — do not delete**", file=file)
+    except Exception as e: print(f"[Discord persist push error] {e}")
+
+async def pull_from_discord():
+    """On startup: fetch the JSON from the data channel and restore it locally."""
+    ch_id = _get_data_channel_id()
+    if not ch_id: return False
+    try:
+        ch = await bot.fetch_channel(int(ch_id))
+        async for msg in ch.history(limit=20):
+            if msg.author == bot.user:
+                for att in msg.attachments:
+                    if att.filename == 'matchmaking.json':
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(att.url) as resp:
+                                text = await resp.text()
+                        data = json.loads(text)
+                        save(data)
+                        print(f"[Discord persist] Restored {sum(len(g.get('players',{})) for g in data.values())} players from Discord.")
+                        return True
+    except Exception as e: print(f"[Discord persist pull error] {e}")
+    return False
+
+def save_and_push(data):
+    """Save locally then schedule a Discord push (fire-and-forget)."""
+    save(data)
+    try:
+        loop = bot.loop
+        if loop and loop.is_running():
+            loop.create_task(push_to_discord())
+    except Exception: pass
 
 def guild_data(gid):
     d = load()
     if gid not in d:
         d[gid] = {'players': {}, 'matches': [], 'queue': [], 'pending_matches': [], 'settings': {}, 'match_counter': 0, 'active_refs': {}}
-        save(d)
+        save_and_push(d)
     return d[gid]
 
 def save_guild(gid, gdata):
-    d = load(); d[gid] = gdata; save(d)
+    d = load(); d[gid] = gdata; save_and_push(d)
 
 def get_player(gdata, uid): return gdata['players'].get(uid)
 
@@ -405,17 +462,13 @@ async def ref_board_update_task():
 @ref_board_update_task.before_loop
 async def before_ref_board(): await bot.wait_until_ready()
 
-@tasks.loop(hours=1)
-async def backup_task():
-    """Write a timestamped backup of all data every hour."""
-    try:
-        data = load()
-        with open(BACKUP_FILE, 'w') as f: json.dump(data, f, indent=2)
-        print(f"[Backup] Written to {BACKUP_FILE}")
-    except Exception as e: print(f"[Backup error] {e}")
+@tasks.loop(minutes=5)
+async def discord_persist_task():
+    """Push data to Discord every 5 minutes as an extra safety net."""
+    await push_to_discord()
 
-@backup_task.before_loop
-async def before_backup(): await bot.wait_until_ready()
+@discord_persist_task.before_loop
+async def before_discord_persist(): await bot.wait_until_ready()
 
 def build_leaderboard_embed(gdata):
     players = [(uid, p) for uid, p in gdata.get('players', {}).items() if p['wins'] + p['losses'] > 0]
@@ -441,7 +494,9 @@ def build_leaderboard_embed(gdata):
 @bot.event
 async def on_ready():
     print(f"✅  Logged in as {bot.user}")
-    print(f"📁  Data file: {DATA_FILE}")
+    # Restore all data from Discord before doing anything else
+    restored = await pull_from_discord()
+    if not restored: print("[Discord persist] No cloud data found — using local file (or fresh start).")
     bot.add_view(RefBoardView())
     try:
         synced = await bot.tree.sync()
@@ -450,7 +505,7 @@ async def on_ready():
     queue_expand_task.start()
     leaderboard_update_task.start()
     ref_board_update_task.start()
-    backup_task.start()
+    discord_persist_task.start()
     print("✅  Bot ready")
 
 @bot.tree.command(name="register", description="Register to play ranked 1v1s")
@@ -721,6 +776,25 @@ async def cmd_adjust_elo(interaction: discord.Interaction, user: discord.Member,
         embed = discord.Embed(title="⚙️  ELO Adjusted", description=f"<@{uid}>\n{old_elo} → **{player['elo']}** ELO  ({sign}{amount})\n{re_} {rn}", colour=colour)
         embed.set_footer(text=f"By {interaction.user.display_name}")
         await interaction.response.send_message(embed=embed)
+    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
+
+@bot.tree.command(name="setup-data-channel", description="Set the private channel where bot data is saved permanently (Admin only — run IN the channel)")
+@app_commands.default_permissions(administrator=True)
+async def cmd_setup_data_channel(interaction: discord.Interaction):
+    try:
+        if not interaction.permissions.administrator:
+            await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
+        gid = str(interaction.guild_id)
+        gdata = guild_data(gid)
+        gdata.setdefault('settings', {})['data_channel_id'] = str(interaction.channel_id)
+        save_guild(gid, gdata)
+        await interaction.response.send_message(
+            f"✅  Data will be saved to <#{interaction.channel_id}> and restored automatically on every restart.\n"
+            f"⚠️  Keep this channel **private** (only the bot should see it).",
+            ephemeral=True
+        )
+        # Push immediately so the first save is there right away
+        await push_to_discord()
     except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
 
 @bot.tree.command(name="setup-queue", description="Set channel where match threads are created — run IN the channel (Admin only)")

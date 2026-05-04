@@ -463,23 +463,36 @@ async def cmd_profile(interaction: discord.Interaction, user: discord.Member = N
         player = get_player(gdata, uid)
         if not player:
             await interaction.response.send_message(f"❌  **{target.display_name}** is not registered.", ephemeral=True); return
+
         _, rank_name, rank_emoji, colour = get_rank(player['elo'])
         total = player['wins'] + player['losses']
         wr    = round(player['wins'] / total * 100) if total else 0
         kda   = round(player['kills'] / max(1, player['deaths']), 2)
-        embed = discord.Embed(title=f"⚔️  {player['name']}'s Player Card", colour=colour)
+        streak = player.get('streak', 0)
+        streak_str = f"🔥 {streak}" if streak > 1 else ("❄️ " + str(abs(streak)) if streak < -1 else "—")
+
+        embed = discord.Embed(colour=colour)
+        embed.set_author(name=f"{target.display_name}  •  Player Card", icon_url=target.display_avatar.url)
+        embed.set_thumbnail(url=target.display_avatar.url)
+
         banners    = gdata.get('settings', {}).get('banners', [])
         banner_idx = player.get('banner', -1)
         if 0 <= banner_idx < len(banners) and banners[banner_idx]:
             embed.set_image(url=banners[banner_idx])
-        embed.set_thumbnail(url=target.display_avatar.url)
-        embed.add_field(name="🏅  ─── RANK ───",   value=f"{rank_emoji}  **{rank_name}**\n`{player['elo']} ELO`",                               inline=True)
-        embed.add_field(name="🎮  ─── RECORD ───",  value=f"**{player['wins']}W**  /  **{player['losses']}L**\n`{total} matches  •  {wr}% WR`",  inline=True)
-        embed.add_field(name="\u200b",               value="\u200b",                                                                               inline=False)
-        embed.add_field(name="🔫  ─── KILLS ───",   value=f"**{player['kills']}**",   inline=True)
-        embed.add_field(name="💀  ─── DEATHS ───",  value=f"**{player['deaths']}**",  inline=True)
-        embed.add_field(name="⚡  ─── KDA ───",     value=f"**{kda}**",               inline=True)
-        embed.set_footer(text=f"Registered  •  {player['registered_at'][:10]}")
+
+        embed.add_field(name="Rank",     value=f"{rank_emoji} **{rank_name}**", inline=True)
+        embed.add_field(name="ELO",      value=f"**{player['elo']}**",          inline=True)
+        embed.add_field(name="Streak",   value=streak_str,                       inline=True)
+
+        embed.add_field(name="Wins",     value=f"**{player['wins']}**",         inline=True)
+        embed.add_field(name="Losses",   value=f"**{player['losses']}**",       inline=True)
+        embed.add_field(name="Win Rate", value=f"**{wr}%**",                    inline=True)
+
+        embed.add_field(name="Kills",    value=f"**{player['kills']}**",        inline=True)
+        embed.add_field(name="Deaths",   value=f"**{player['deaths']}**",       inline=True)
+        embed.add_field(name="KDA",      value=f"**{kda}**",                    inline=True)
+
+        embed.set_footer(text=f"Registered {player['registered_at'][:10]}  •  {total} matches played")
         await interaction.response.send_message(embed=embed)
     except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
 

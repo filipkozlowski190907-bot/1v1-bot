@@ -1,12 +1,36 @@
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
-import json
 import os
 from datetime import datetime, timezone
+from pymongo import MongoClient
 
-TOKEN     = os.getenv('DISCORD_TOKEN')
-DATA_FILE = 'matchmaking.json'
+TOKEN = os.getenv('DISCORD_TOKEN')
+
+# ── MongoDB ────────────────────────────────────────────────────────────────────
+_mongo = MongoClient(os.getenv('MONGO_URI'))
+_col   = _mongo['botpy']['guilds']
+
+def load():
+    """Return {gid: gdata} for all guilds (used by background tasks)."""
+    return {doc['_id']: {k: v for k, v in doc.items() if k != '_id'} for doc in _col.find()}
+
+def save(all_data):
+    """Bulk-save all guild data (used by background tasks)."""
+    for gid, gdata in all_data.items():
+        _col.update_one({'_id': gid}, {'$set': gdata}, upsert=True)
+
+def guild_data(gid):
+    doc = _col.find_one({'_id': gid})
+    if doc is None:
+        gdata = {'players': {}, 'matches': [], 'queue': [], 'pending_matches': [], 'settings': {}, 'match_counter': 0, 'active_refs': {}}
+        _col.insert_one({'_id': gid, **gdata})
+        return gdata
+    return {k: v for k, v in doc.items() if k != '_id'}
+
+def save_guild(gid, gdata):
+    _col.update_one({'_id': gid}, {'$set': gdata}, upsert=True)
+# ──────────────────────────────────────────────────────────────────────────────
 
 RANKS = [
     (0,    'Bronze',   '🥉', discord.Colour.from_rgb(205, 127, 50)),
@@ -60,24 +84,6 @@ def new_elos(winner_elo, loser_elo, winner_score=5, loser_score=0, same_region=T
     gained = max(10, round(base_gain * margin * region_mod * rank_mod))
     lost   = max(5,  round(base_loss * margin * region_mod * rank_mod))
     return winner_elo + gained, loser_elo - lost, gained, lost
-
-def load():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'r') as f: return json.load(f)
-    return {}
-
-def save(data):
-    with open(DATA_FILE, 'w') as f: json.dump(data, f, indent=2)
-
-def guild_data(gid):
-    d = load()
-    if gid not in d:
-        d[gid] = {'players': {}, 'matches': [], 'queue': [], 'pending_matches': [], 'settings': {}, 'match_counter': 0, 'active_refs': {}}
-        save(d)
-    return d[gid]
-
-def save_guild(gid, gdata):
-    d = load(); d[gid] = gdata; save(d)
 
 def get_player(gdata, uid): return gdata['players'].get(uid)
 

@@ -463,36 +463,23 @@ async def cmd_profile(interaction: discord.Interaction, user: discord.Member = N
         player = get_player(gdata, uid)
         if not player:
             await interaction.response.send_message(f"❌  **{target.display_name}** is not registered.", ephemeral=True); return
-
         _, rank_name, rank_emoji, colour = get_rank(player['elo'])
         total = player['wins'] + player['losses']
         wr    = round(player['wins'] / total * 100) if total else 0
         kda   = round(player['kills'] / max(1, player['deaths']), 2)
-        streak = player.get('streak', 0)
-        streak_str = f"🔥 {streak}" if streak > 1 else ("❄️ " + str(abs(streak)) if streak < -1 else "—")
-
-        embed = discord.Embed(colour=colour)
-        embed.set_author(name=f"{target.display_name}  •  Player Card", icon_url=target.display_avatar.url)
-        embed.set_thumbnail(url=target.display_avatar.url)
-
+        embed = discord.Embed(title=f"⚔️  {player['name']}'s Player Card", colour=colour)
         banners    = gdata.get('settings', {}).get('banners', [])
         banner_idx = player.get('banner', -1)
         if 0 <= banner_idx < len(banners) and banners[banner_idx]:
             embed.set_image(url=banners[banner_idx])
-
-        embed.add_field(name="Rank",     value=f"{rank_emoji} **{rank_name}**", inline=True)
-        embed.add_field(name="ELO",      value=f"**{player['elo']}**",          inline=True)
-        embed.add_field(name="Streak",   value=streak_str,                       inline=True)
-
-        embed.add_field(name="Wins",     value=f"**{player['wins']}**",         inline=True)
-        embed.add_field(name="Losses",   value=f"**{player['losses']}**",       inline=True)
-        embed.add_field(name="Win Rate", value=f"**{wr}%**",                    inline=True)
-
-        embed.add_field(name="Kills",    value=f"**{player['kills']}**",        inline=True)
-        embed.add_field(name="Deaths",   value=f"**{player['deaths']}**",       inline=True)
-        embed.add_field(name="KDA",      value=f"**{kda}**",                    inline=True)
-
-        embed.set_footer(text=f"Registered {player['registered_at'][:10]}  •  {total} matches played")
+        embed.set_thumbnail(url=target.display_avatar.url)
+        embed.add_field(name="🏅  ─── RANK ───",   value=f"{rank_emoji}  **{rank_name}**\n`{player['elo']} ELO`",                               inline=True)
+        embed.add_field(name="🎮  ─── RECORD ───",  value=f"**{player['wins']}W**  /  **{player['losses']}L**\n`{total} matches  •  {wr}% WR`",  inline=True)
+        embed.add_field(name="\u200b",               value="\u200b",                                                                               inline=False)
+        embed.add_field(name="🔫  ─── KILLS ───",   value=f"**{player['kills']}**",   inline=True)
+        embed.add_field(name="💀  ─── DEATHS ───",  value=f"**{player['deaths']}**",  inline=True)
+        embed.add_field(name="⚡  ─── KDA ───",     value=f"**{kda}**",               inline=True)
+        embed.set_footer(text=f"Registered  •  {player['registered_at'][:10]}")
         await interaction.response.send_message(embed=embed)
     except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
 
@@ -572,6 +559,99 @@ async def cmd_active(interaction: discord.Interaction):
         embed = discord.Embed(title=f"⚔️  Active Matches — {len(ongoing)}", colour=discord.Colour.orange())
         embed.description = "\n".join([f"**#{m['id']}**  •  {m['p1_name']} vs {m['p2_name']}  •  🌍 {m['region']}" for m in ongoing])
         await interaction.response.send_message(embed=embed)
+    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
+
+@bot.tree.command(name="unclaim-match", description="Unclaim a match you are refereeing (Ref only)")
+@app_commands.describe(match_id="Match ID to unclaim")
+async def cmd_unclaim(interaction: discord.Interaction, match_id: int):
+    try:
+        gid   = str(interaction.guild_id)
+        gdata = guild_data(gid)
+        ref_role = gdata.get('settings', {}).get('ref_role', 'Ref')
+        is_ref = any(r.name.lower() == ref_role.lower() for r in interaction.user.roles)
+        if not is_ref and not interaction.permissions.administrator:
+            await interaction.response.send_message(f"❌  You need the **{ref_role}** role.", ephemeral=True); return
+        uid   = str(interaction.user.id)
+        match = next((m for m in gdata.get('pending_matches', []) if m['id'] == match_id), None)
+        if not match:
+            await interaction.response.send_message(f"❌  Match #{match_id} not found in pending matches.", ephemeral=True); return
+        if match.get('ref_uid') != uid and not interaction.permissions.administrator:
+            await interaction.response.send_message("❌  You didn't claim this match.", ephemeral=True); return
+        match['status'] = 'waiting_for_ref'
+        match.pop('ref_uid', None)
+        if uid in gdata.get('active_refs', {}):
+            del gdata['active_refs'][uid]
+        save_guild(gid, gdata)
+        await update_ref_board(interaction.guild, gdata, gdata.get('settings', {}))
+        await interaction.response.send_message(f"✅  You've unclaimed **Match #{match_id}**. It's back in the queue for another ref.", ephemeral=True)
+    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
+
+@bot.tree.command(name="cancel-match", description="Cancel a match that cannot be completed (Ref only)")
+@app_commands.describe(match_id="Match ID to cancel", reason="Reason for cancellation")
+async def cmd_cancel_match(interaction: discord.Interaction, match_id: int, reason: str = "No reason given"):
+    try:
+        gid   = str(interaction.guild_id)
+        gdata = guild_data(gid)
+        ref_role = gdata.get('settings', {}).get('ref_role', 'Ref')
+        is_ref = any(r.name.lower() == ref_role.lower() for r in interaction.user.roles)
+        if not is_ref and not interaction.permissions.administrator:
+            await interaction.response.send_message(f"❌  You need the **{ref_role}** role.", ephemeral=True); return
+
+        # Check ongoing matches first, then pending
+        match = next((m for m in gdata.get('matches', []) if m['id'] == match_id and m['status'] == 'ongoing'), None)
+        is_pending = False
+        if not match:
+            match = next((m for m in gdata.get('pending_matches', []) if m['id'] == match_id), None)
+            is_pending = True
+        if not match:
+            await interaction.response.send_message(f"❌  Match #{match_id} not found or already completed.", ephemeral=True); return
+
+        # Clean up VC and thread
+        if match.get('vc_id'):
+            try:
+                vc = bot.get_channel(int(match['vc_id'])) or await bot.fetch_channel(int(match['vc_id']))
+                if vc: await vc.delete()
+            except Exception: pass
+        if match.get('thread_id'):
+            try:
+                t = await bot.fetch_channel(int(match['thread_id']))
+                await t.delete()
+            except Exception: pass
+
+        # Free up the ref
+        ref_uid = match.get('ref_uid')
+        if ref_uid and ref_uid in gdata.get('active_refs', {}):
+            del gdata['active_refs'][ref_uid]
+
+        # Remove from the right list
+        if is_pending:
+            gdata['pending_matches'] = [m for m in gdata.get('pending_matches', []) if m['id'] != match_id]
+        else:
+            match['status'] = 'cancelled'
+
+        save_guild(gid, gdata)
+        await update_ref_board(interaction.guild, gdata, gdata.get('settings', {}))
+
+        # Notify players
+        for uid in [match.get('p1'), match.get('p2')]:
+            if not uid: continue
+            try:
+                m = interaction.guild.get_member(int(uid)) or await interaction.guild.fetch_member(int(uid))
+                await m.send(f"❌  **Match #{match_id}** has been cancelled by a ref.\n📝 Reason: {reason}")
+            except Exception: pass
+
+        embed = discord.Embed(title=f"🚫  Match #{match_id} — Cancelled", colour=discord.Colour.red())
+        embed.add_field(name="Players", value=f"<@{match['p1']}> vs <@{match['p2']}>", inline=True)
+        embed.add_field(name="Region",  value=match.get('region', '—'),                 inline=True)
+        embed.add_field(name="Reason",  value=reason,                                   inline=False)
+        embed.set_footer(text=f"Cancelled by {interaction.user.display_name}")
+        embed.timestamp = datetime.now(timezone.utc)
+        await interaction.response.send_message(embed=embed)
+
+        log_ch_id = gdata.get('settings', {}).get('log_channel_id')
+        if log_ch_id:
+            try: await (await bot.fetch_channel(int(log_ch_id))).send(embed=embed)
+            except Exception: pass
     except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
 
 @bot.tree.command(name="confirm-result", description="Confirm a match result (Ref only)")

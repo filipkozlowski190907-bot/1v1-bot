@@ -161,12 +161,87 @@ async def update_ref_board(guild, gdata, settings):
         await msg.edit(embed=build_ref_embed(gdata), view=RefBoardView())
     except Exception as e: print(f"[RefBoard update error] {e}")
 
+class ScoreModal(discord.ui.Modal, title='Submit Match Result'):
+    winner = discord.ui.TextInput(label='Winner (enter 1 for Player 1, 2 for Player 2)', placeholder='1 or 2', max_length=1)
+    p1_score = discord.ui.TextInput(label='Player 1 Score', placeholder='e.g. 5', max_length=2)
+    p2_score = discord.ui.TextInput(label='Player 2 Score', placeholder='e.g. 3', max_length=2)
+
+    def __init__(self, match_id):
+        super().__init__()
+        self.match_id = match_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        gid   = str(interaction.guild_id)
+        gdata = guild_data(gid)
+        match = next((m for m in gdata['matches'] if m['id'] == self.match_id), None)
+        if not match or match['status'] != 'ongoing':
+            await interaction.response.send_message("❌  Match not found or already ended.", ephemeral=True); return
+        try:
+            p1s = int(self.p1_score.value)
+            p2s = int(self.p2_score.value)
+            w   = self.winner.value.strip()
+            if w not in ('1', '2'): raise ValueError
+        except ValueError:
+            await interaction.response.send_message("❌  Invalid input. Winner must be 1 or 2, scores must be numbers.", ephemeral=True); return
+
+        winner_id = match['p1'] if w == '1' else match['p2']
+        loser_id  = match['p2'] if w == '1' else match['p1']
+        w_score   = p1s if w == '1' else p2s
+        l_score   = p2s if w == '1' else p1s
+        w_p = gdata['players'].get(winner_id)
+        l_p = gdata['players'].get(loser_id)
+        if not w_p or not l_p:
+            await interaction.response.send_message("❌  Player data not found.", ephemeral=True); return
+
+        old_w, old_l = w_p['elo'], l_p['elo']
+        new_w, new_l, gained, lost = new_elos(old_w, old_l, w_score, l_score, True)
+        w_p['elo'] = new_w;          w_p['wins']   += 1; w_p['kills']  += w_score; w_p['deaths'] += l_score
+        l_p['elo'] = max(100, new_l); l_p['losses'] += 1; l_p['kills']  += l_score; l_p['deaths'] += w_score
+        match.update({'status': 'completed', 'winner': winner_id, 'p1_score': p1s, 'p2_score': p2s,
+                      'confirmed_by': str(interaction.user.id), 'completed_at': datetime.now(timezone.utc).isoformat(),
+                      'elo_gained': gained, 'elo_lost': lost})
+        w_p['matches'].append(self.match_id); l_p['matches'].append(self.match_id)
+        ref_uid = match.get('ref_uid')
+        if ref_uid and ref_uid in gdata.get('active_refs', {}): del gdata['active_refs'][ref_uid]
+        save_guild(gid, gdata)
+
+        _, wr, we, wc = get_rank(new_w); _, lr, le, _ = get_rank(new_l)
+        embed = discord.Embed(title=f"✅  Match #{self.match_id} — Result Confirmed", colour=wc)
+        embed.add_field(name="🏆  Winner", value=f"<@{winner_id}>\n{we} {wr}\n{old_w} → **{new_w}** ELO (+{gained})", inline=True)
+        embed.add_field(name="💀  Loser",  value=f"<@{loser_id}>\n{le} {lr}\n{old_l} → **{new_l}** ELO (-{lost})",   inline=True)
+        embed.add_field(name="📊  Score",  value=f"**{p1s} — {p2s}**", inline=False)
+        embed.set_footer(text=f"Confirmed by {interaction.user.display_name}")
+        embed.timestamp = datetime.now(timezone.utc)
+        await interaction.response.send_message(embed=embed)
+
+        log_ch_id = gdata.get('settings', {}).get('log_channel_id')
+        if log_ch_id:
+            try: await (await bot.fetch_channel(int(log_ch_id))).send(embed=embed)
+            except Exception: pass
+
+        # Delete VC
+        if match.get('vc_id'):
+            try:
+                vc = bot.get_channel(int(match['vc_id'])) or await bot.fetch_channel(int(match['vc_id']))
+                if vc: await vc.delete()
+            except Exception as e: print(f"[VC delete error] {e}")
+
+        # Delete thread
+        if match.get('thread_id'):
+            try:
+                t = await bot.fetch_channel(int(match['thread_id']))
+                await t.delete()
+            except Exception as e: print(f"[Thread delete error] {e}")
+
+        await update_ref_board(interaction.guild, guild_data(gid), guild_data(gid).get('settings', {}))
+
+
 class EndGameView(discord.ui.View):
     def __init__(self, match_id):
         super().__init__(timeout=None)
         self.match_id = match_id
 
-    @discord.ui.button(label='🔒 End Game', style=discord.ButtonStyle.danger, custom_id='end_game')
+    @discord.ui.button(label='🔒 End Game & Submit Score', style=discord.ButtonStyle.danger, custom_id='end_game')
     async def btn_end(self, interaction: discord.Interaction, button: discord.ui.Button):
         gid   = str(interaction.guild_id)
         gdata = guild_data(gid)
@@ -179,40 +254,7 @@ class EndGameView(discord.ui.View):
             await interaction.response.send_message("❌  Match not found.", ephemeral=True); return
         if match['status'] != 'ongoing':
             await interaction.response.send_message("❌  Match already ended.", ephemeral=True); return
-
-        await interaction.response.send_message("✅  Game ended! Use `/confirm-result` to submit the final score.", ephemeral=True)
-
-        log_ch_id = gdata.get('settings', {}).get('log_channel_id')
-        if log_ch_id:
-            try:
-                log_ch = await bot.fetch_channel(int(log_ch_id))
-                embed = discord.Embed(title=f"📋  Match #{self.match_id} — Ended", colour=discord.Colour.orange())
-                embed.add_field(name="Players", value=f"<@{match['p1']}> vs <@{match['p2']}>", inline=True)
-                embed.add_field(name="Region",  value=match['region'],                          inline=True)
-                embed.add_field(name="Ref",     value=f"<@{interaction.user.id}>",             inline=True)
-                embed.set_footer(text="Awaiting result confirmation")
-                embed.timestamp = datetime.now(timezone.utc)
-                await log_ch.send(embed=embed)
-            except Exception as e: print(f"[Log error] {e}")
-
-        # Delete VC first
-        if match.get('vc_id'):
-            try:
-                vc = bot.get_channel(int(match['vc_id'])) or await bot.fetch_channel(int(match['vc_id']))
-                if vc: await vc.delete()
-            except Exception: pass
-
-        # Delete thread fully
-        if match.get('thread_id'):
-            try:
-                t = await bot.fetch_channel(int(match['thread_id']))
-                await t.delete()
-            except Exception: pass
-
-        ref_uid = match.get('ref_uid')
-        if ref_uid and ref_uid in gdata.get('active_refs', {}):
-            del gdata['active_refs'][ref_uid]
-        save_guild(gid, gdata)
+        await interaction.response.send_modal(ScoreModal(self.match_id))
 
 async def create_match(guild, gdata, pending, ref_uid):
     gid      = str(guild.id)
@@ -476,15 +518,15 @@ async def cmd_profile(interaction: discord.Interaction, user: discord.Member = N
         banner_idx = player.get('banner', -1)
         if 0 <= banner_idx < len(banners) and banners[banner_idx]:
             embed.set_image(url=banners[banner_idx])
-        embed.add_field(name="Rank",     value=f"{rank_emoji} **{rank_name}**", inline=True)
-        embed.add_field(name="ELO",      value=f"**{player['elo']}**",          inline=True)
-        embed.add_field(name="Streak",   value=streak_str,                       inline=True)
-        embed.add_field(name="Wins",     value=f"**{player['wins']}**",         inline=True)
-        embed.add_field(name="Losses",   value=f"**{player['losses']}**",       inline=True)
-        embed.add_field(name="Win Rate", value=f"**{wr}%**",                    inline=True)
-        embed.add_field(name="Kills",    value=f"**{player['kills']}**",        inline=True)
-        embed.add_field(name="Deaths",   value=f"**{player['deaths']}**",       inline=True)
-        embed.add_field(name="KDA",      value=f"**{kda}**",                    inline=True)
+        embed.add_field(name="Rank:",     value=f"`{rank_emoji} {rank_name}`", inline=True)
+        embed.add_field(name="ELO:",      value=f"`{player['elo']}`",          inline=True)
+        embed.add_field(name="Streak:",   value=f"`{streak_str}`",             inline=True)
+        embed.add_field(name="Wins:",     value=f"`{player['wins']}`",         inline=True)
+        embed.add_field(name="Losses:",   value=f"`{player['losses']}`",       inline=True)
+        embed.add_field(name="Win Rate:", value=f"`{wr}%`",                    inline=True)
+        embed.add_field(name="Kills:",    value=f"`{player['kills']}`",        inline=True)
+        embed.add_field(name="Deaths:",   value=f"`{player['deaths']}`",       inline=True)
+        embed.add_field(name="KDA:",      value=f"`{kda}`",                    inline=True)
         embed.set_footer(text=f"Registered {player['registered_at'][:10]}  •  {total} matches played")
         await interaction.response.send_message(embed=embed)
     except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
@@ -585,8 +627,7 @@ async def cmd_unclaim(interaction: discord.Interaction, match_id: int):
             await interaction.response.send_message("❌  You didn't claim this match.", ephemeral=True); return
         match['status'] = 'waiting_for_ref'
         match.pop('ref_uid', None)
-        if uid in gdata.get('active_refs', {}):
-            del gdata['active_refs'][uid]
+        if uid in gdata.get('active_refs', {}): del gdata['active_refs'][uid]
         save_guild(gid, gdata)
         await update_ref_board(interaction.guild, gdata, gdata.get('settings', {}))
         await interaction.response.send_message(f"✅  You've unclaimed **Match #{match_id}**. It's back in the queue for another ref.", ephemeral=True)
@@ -620,8 +661,7 @@ async def cmd_cancel_match(interaction: discord.Interaction, match_id: int, reas
                 await t.delete()
             except Exception: pass
         ref_uid = match.get('ref_uid')
-        if ref_uid and ref_uid in gdata.get('active_refs', {}):
-            del gdata['active_refs'][ref_uid]
+        if ref_uid and ref_uid in gdata.get('active_refs', {}): del gdata['active_refs'][ref_uid]
         if is_pending:
             gdata['pending_matches'] = [m for m in gdata.get('pending_matches', []) if m['id'] != match_id]
         else:

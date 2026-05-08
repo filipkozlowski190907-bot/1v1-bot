@@ -161,63 +161,29 @@ async def update_ref_board(guild, gdata, settings):
         await msg.edit(embed=build_ref_embed(gdata), view=RefBoardView())
     except Exception as e: print(f"[RefBoard update error] {e}")
 
-class ScoreModal(discord.ui.Modal, title='Submit Match Result'):
-    winner = discord.ui.TextInput(label='Winner (enter 1 for Player 1, 2 for Player 2)', placeholder='1 or 2', max_length=1)
-    p1_score = discord.ui.TextInput(label='Player 1 Score', placeholder='e.g. 5', max_length=2)
-    p2_score = discord.ui.TextInput(label='Player 2 Score', placeholder='e.g. 3', max_length=2)
-
+class EndGameView(discord.ui.View):
     def __init__(self, match_id):
-        super().__init__()
+        super().__init__(timeout=None)
         self.match_id = match_id
 
-    async def on_submit(self, interaction: discord.Interaction):
+    @discord.ui.button(label='🔒 Close Game', style=discord.ButtonStyle.danger, custom_id='end_game')
+    async def btn_end(self, interaction: discord.Interaction, button: discord.ui.Button):
         gid   = str(interaction.guild_id)
         gdata = guild_data(gid)
+        ref_role = gdata.get('settings', {}).get('ref_role', 'Ref')
+        is_ref = any(r.name.lower() == ref_role.lower() for r in interaction.user.roles)
+        if not is_ref and not interaction.permissions.administrator:
+            await interaction.response.send_message("❌  Only refs can close the game.", ephemeral=True); return
         match = next((m for m in gdata['matches'] if m['id'] == self.match_id), None)
-        if not match or match['status'] != 'ongoing':
-            await interaction.response.send_message("❌  Match not found or already ended.", ephemeral=True); return
-        try:
-            p1s = int(self.p1_score.value)
-            p2s = int(self.p2_score.value)
-            w   = self.winner.value.strip()
-            if w not in ('1', '2'): raise ValueError
-        except ValueError:
-            await interaction.response.send_message("❌  Invalid input. Winner must be 1 or 2, scores must be numbers.", ephemeral=True); return
+        if not match:
+            await interaction.response.send_message("❌  Match not found.", ephemeral=True); return
+        if match['status'] == 'completed':
+            await interaction.response.send_message("❌  Match already closed.", ephemeral=True); return
+        if match['status'] != 'score_confirmed':
+            await interaction.response.send_message("❌  You must run `/confirm-result` with a screenshot before closing the game.", ephemeral=True); return
 
-        winner_id = match['p1'] if w == '1' else match['p2']
-        loser_id  = match['p2'] if w == '1' else match['p1']
-        w_score   = p1s if w == '1' else p2s
-        l_score   = p2s if w == '1' else p1s
-        w_p = gdata['players'].get(winner_id)
-        l_p = gdata['players'].get(loser_id)
-        if not w_p or not l_p:
-            await interaction.response.send_message("❌  Player data not found.", ephemeral=True); return
-
-        old_w, old_l = w_p['elo'], l_p['elo']
-        new_w, new_l, gained, lost = new_elos(old_w, old_l, w_score, l_score, True)
-        w_p['elo'] = new_w;          w_p['wins']   += 1; w_p['kills']  += w_score; w_p['deaths'] += l_score
-        l_p['elo'] = max(100, new_l); l_p['losses'] += 1; l_p['kills']  += l_score; l_p['deaths'] += w_score
-        match.update({'status': 'completed', 'winner': winner_id, 'p1_score': p1s, 'p2_score': p2s,
-                      'confirmed_by': str(interaction.user.id), 'completed_at': datetime.now(timezone.utc).isoformat(),
-                      'elo_gained': gained, 'elo_lost': lost})
-        w_p['matches'].append(self.match_id); l_p['matches'].append(self.match_id)
-        ref_uid = match.get('ref_uid')
-        if ref_uid and ref_uid in gdata.get('active_refs', {}): del gdata['active_refs'][ref_uid]
+        match['status'] = 'completed'
         save_guild(gid, gdata)
-
-        _, wr, we, wc = get_rank(new_w); _, lr, le, _ = get_rank(new_l)
-        embed = discord.Embed(title=f"✅  Match #{self.match_id} — Result Confirmed", colour=wc)
-        embed.add_field(name="🏆  Winner", value=f"<@{winner_id}>\n{we} {wr}\n{old_w} → **{new_w}** ELO (+{gained})", inline=True)
-        embed.add_field(name="💀  Loser",  value=f"<@{loser_id}>\n{le} {lr}\n{old_l} → **{new_l}** ELO (-{lost})",   inline=True)
-        embed.add_field(name="📊  Score",  value=f"**{p1s} — {p2s}**", inline=False)
-        embed.set_footer(text=f"Confirmed by {interaction.user.display_name}")
-        embed.timestamp = datetime.now(timezone.utc)
-        await interaction.response.send_message(embed=embed)
-
-        log_ch_id = gdata.get('settings', {}).get('log_channel_id')
-        if log_ch_id:
-            try: await (await bot.fetch_channel(int(log_ch_id))).send(embed=embed)
-            except Exception: pass
 
         # Delete VC
         if match.get('vc_id'):
@@ -233,28 +199,8 @@ class ScoreModal(discord.ui.Modal, title='Submit Match Result'):
                 await t.delete()
             except Exception as e: print(f"[Thread delete error] {e}")
 
+        await interaction.response.send_message("✅  Game closed. VC and thread deleted.", ephemeral=True)
         await update_ref_board(interaction.guild, guild_data(gid), guild_data(gid).get('settings', {}))
-
-
-class EndGameView(discord.ui.View):
-    def __init__(self, match_id):
-        super().__init__(timeout=None)
-        self.match_id = match_id
-
-    @discord.ui.button(label='🔒 End Game & Submit Score', style=discord.ButtonStyle.danger, custom_id='end_game')
-    async def btn_end(self, interaction: discord.Interaction, button: discord.ui.Button):
-        gid   = str(interaction.guild_id)
-        gdata = guild_data(gid)
-        ref_role = gdata.get('settings', {}).get('ref_role', 'Ref')
-        is_ref = any(r.name.lower() == ref_role.lower() for r in interaction.user.roles)
-        if not is_ref and not interaction.permissions.administrator:
-            await interaction.response.send_message("❌  Only refs can end the game.", ephemeral=True); return
-        match = next((m for m in gdata['matches'] if m['id'] == self.match_id), None)
-        if not match:
-            await interaction.response.send_message("❌  Match not found.", ephemeral=True); return
-        if match['status'] != 'ongoing':
-            await interaction.response.send_message("❌  Match already ended.", ephemeral=True); return
-        await interaction.response.send_modal(ScoreModal(self.match_id))
 
 async def create_match(guild, gdata, pending, ref_uid):
     gid      = str(guild.id)
@@ -687,10 +633,10 @@ async def cmd_cancel_match(interaction: discord.Interaction, match_id: int, reas
             except Exception: pass
     except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
 
-@bot.tree.command(name="confirm-result", description="Confirm a match result (Ref only)")
+@bot.tree.command(name="confirm-result", description="Confirm a match result with screenshot (Ref only)")
 @app_commands.default_permissions(administrator=True)
-@app_commands.describe(match_id="Match ID", winner_id="Discord user ID of the winner", p1_score="Player 1 score", p2_score="Player 2 score")
-async def cmd_confirm(interaction: discord.Interaction, match_id: int, winner_id: str, p1_score: int, p2_score: int):
+@app_commands.describe(match_id="Match ID", winner_id="Discord user ID of the winner", p1_score="Player 1 score", p2_score="Player 2 score", screenshot="Screenshot of the match result")
+async def cmd_confirm(interaction: discord.Interaction, match_id: int, winner_id: str, p1_score: int, p2_score: int, screenshot: discord.Attachment):
     try:
         gid   = str(interaction.guild_id)
         gdata = guild_data(gid)
@@ -698,9 +644,13 @@ async def cmd_confirm(interaction: discord.Interaction, match_id: int, winner_id
         is_ref = any(r.name.lower() == ref_role.lower() for r in interaction.user.roles)
         if not is_ref and not interaction.permissions.administrator:
             await interaction.response.send_message(f"❌  You need the **{ref_role}** role.", ephemeral=True); return
+        if not screenshot.content_type or not screenshot.content_type.startswith('image/'):
+            await interaction.response.send_message("❌  Please attach an image screenshot.", ephemeral=True); return
         match = next((m for m in gdata['matches'] if m['id'] == match_id), None)
         if not match:
             await interaction.response.send_message(f"❌  Match #{match_id} not found.", ephemeral=True); return
+        if match['status'] not in ('ongoing',):
+            await interaction.response.send_message(f"❌  Match #{match_id} is not ongoing (status: {match['status']}).", ephemeral=True); return
         if winner_id not in (match['p1'], match['p2']):
             await interaction.response.send_message("❌  Winner ID must be one of the two players.", ephemeral=True); return
         loser_id = match['p2'] if winner_id == match['p1'] else match['p1']
@@ -711,11 +661,12 @@ async def cmd_confirm(interaction: discord.Interaction, match_id: int, winner_id
         old_w, old_l = w_p['elo'], l_p['elo']
         w_score = p1_score if winner_id == match['p1'] else p2_score
         l_score = p2_score if winner_id == match['p1'] else p1_score
-        same_region = match.get('region') == match.get('region')  # both in same match region
-        new_w, new_l, gained, lost = new_elos(old_w, old_l, w_score, l_score, same_region)
+        new_w, new_l, gained, lost = new_elos(old_w, old_l, w_score, l_score, True)
         w_p['elo'] = new_w; w_p['wins'] += 1; w_p['kills'] += w_score; w_p['deaths'] += l_score
         l_p['elo'] = max(100, new_l); l_p['losses'] += 1; l_p['kills'] += l_score; l_p['deaths'] += w_score
-        match.update({'status': 'completed', 'winner': winner_id, 'p1_score': p1_score, 'p2_score': p2_score, 'confirmed_by': str(interaction.user.id), 'completed_at': datetime.now(timezone.utc).isoformat(), 'elo_gained': gained, 'elo_lost': lost})
+        match.update({'status': 'score_confirmed', 'winner': winner_id, 'p1_score': p1_score, 'p2_score': p2_score,
+                      'confirmed_by': str(interaction.user.id), 'completed_at': datetime.now(timezone.utc).isoformat(),
+                      'elo_gained': gained, 'elo_lost': lost, 'screenshot_url': screenshot.url})
         w_p['matches'].append(match_id); l_p['matches'].append(match_id)
         ref_uid = match.get('ref_uid')
         if ref_uid and ref_uid in gdata.get('active_refs', {}): del gdata['active_refs'][ref_uid]
@@ -725,17 +676,17 @@ async def cmd_confirm(interaction: discord.Interaction, match_id: int, winner_id
         embed.add_field(name="🏆  Winner", value=f"<@{winner_id}>\n{we} {wr}\n{old_w} → **{new_w}** ELO (+{gained})", inline=True)
         embed.add_field(name="💀  Loser",  value=f"<@{loser_id}>\n{le} {lr}\n{old_l} → **{new_l}** ELO (-{lost})", inline=True)
         embed.add_field(name="📊  Score",  value=f"**{p1_score} — {p2_score}**", inline=False)
-        embed.set_footer(text=f"Confirmed by {interaction.user.display_name}")
+        embed.set_image(url=screenshot.url)
+        embed.set_footer(text=f"Confirmed by {interaction.user.display_name}  •  Click 🔒 Close Game to finish")
         embed.timestamp = datetime.now(timezone.utc)
         await interaction.response.send_message(embed=embed)
         log_ch_id = gdata.get('settings', {}).get('log_channel_id')
         if log_ch_id:
-            try:
-                await (await bot.fetch_channel(int(log_ch_id))).send(embed=embed)
+            try: await (await bot.fetch_channel(int(log_ch_id))).send(embed=embed)
             except Exception: pass
     except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
 
-@bot.tree.command(name="rollback", description="Roll back last N matches for a player (Admin only)")
+@bot.tree.command(name="rollback", description="Roll back last N matches for a player and their opponents (Admin only)")
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(user="Player to roll back", games="Number of recent games to reverse")
 async def cmd_rollback(interaction: discord.Interaction, user: discord.Member, games: int):
@@ -747,21 +698,59 @@ async def cmd_rollback(interaction: discord.Interaction, user: discord.Member, g
         player = get_player(gdata, uid)
         if not player:
             await interaction.response.send_message("❌  Player not registered.", ephemeral=True); return
-        completed = sorted([m for m in gdata['matches'] if m['status'] == 'completed' and uid in (m['p1'], m['p2'])], key=lambda x: x.get('completed_at', ''), reverse=True)[:games]
+        completed = sorted(
+            [m for m in gdata['matches'] if m['status'] in ('completed', 'score_confirmed') and uid in (m['p1'], m['p2'])],
+            key=lambda x: x.get('completed_at', ''), reverse=True
+        )[:games]
         if not completed:
             await interaction.response.send_message("❌  No completed matches to roll back.", ephemeral=True); return
-        old_elo = player['elo']; rolled = []
+
+        old_elo = player['elo']
+        rolled = []
+        affected_opponents = {}  # uid -> (old_elo, new_elo)
+
         for m in completed:
+            opponent_uid = m['p2'] if m['p1'] == uid else m['p1']
+            opponent = gdata['players'].get(opponent_uid)
+
+            # Roll back the target player
             if m['winner'] == uid:
                 player['elo'] -= m.get('elo_gained', 20); player['wins'] = max(0, player['wins'] - 1)
+                player['kills']  = max(0, player['kills']  - m.get('p1_score' if m['p1'] == uid else 'p2_score', 0))
+                player['deaths'] = max(0, player['deaths'] - m.get('p2_score' if m['p1'] == uid else 'p1_score', 0))
             else:
                 player['elo'] += m.get('elo_lost', 20); player['losses'] = max(0, player['losses'] - 1)
-            player['elo'] = max(100, player['elo']); m['status'] = 'rolled_back'; rolled.append(m['id'])
+                player['kills']  = max(0, player['kills']  - m.get('p1_score' if m['p1'] == uid else 'p2_score', 0))
+                player['deaths'] = max(0, player['deaths'] - m.get('p2_score' if m['p1'] == uid else 'p1_score', 0))
+            player['elo'] = max(100, player['elo'])
+
+            # Roll back the opponent
+            if opponent:
+                opp_old = opponent_uid not in affected_opponents and opponent['elo']
+                if opponent_uid not in affected_opponents:
+                    affected_opponents[opponent_uid] = {'old_elo': opponent['elo']}
+                if m['winner'] == opponent_uid:
+                    opponent['elo'] -= m.get('elo_gained', 20); opponent['wins'] = max(0, opponent['wins'] - 1)
+                    opponent['kills']  = max(0, opponent['kills']  - m.get('p1_score' if m['p1'] == opponent_uid else 'p2_score', 0))
+                    opponent['deaths'] = max(0, opponent['deaths'] - m.get('p2_score' if m['p1'] == opponent_uid else 'p1_score', 0))
+                else:
+                    opponent['elo'] += m.get('elo_lost', 20); opponent['losses'] = max(0, opponent['losses'] - 1)
+                    opponent['kills']  = max(0, opponent['kills']  - m.get('p1_score' if m['p1'] == opponent_uid else 'p2_score', 0))
+                    opponent['deaths'] = max(0, opponent['deaths'] - m.get('p2_score' if m['p1'] == opponent_uid else 'p1_score', 0))
+                opponent['elo'] = max(100, opponent['elo'])
+                affected_opponents[opponent_uid]['new_elo'] = opponent['elo']
+
+            m['status'] = 'rolled_back'
+            rolled.append(m['id'])
+
         save_guild(gid, gdata)
         embed = discord.Embed(title="↩️  Rollback Complete", colour=discord.Colour.orange())
         embed.add_field(name="Player",            value=f"<@{uid}>",                                                    inline=True)
         embed.add_field(name="Games Rolled Back", value=f"**{len(rolled)}**  (#{', #'.join(str(x) for x in rolled)})", inline=True)
         embed.add_field(name="ELO Change",        value=f"{old_elo} → **{player['elo']}**",                            inline=False)
+        if affected_opponents:
+            opp_lines = [f"<@{ouid}>: {v['old_elo']} → **{v['new_elo']}**" for ouid, v in affected_opponents.items()]
+            embed.add_field(name="Opponents Also Rolled Back", value="\n".join(opp_lines), inline=False)
         await interaction.response.send_message(embed=embed)
     except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
 

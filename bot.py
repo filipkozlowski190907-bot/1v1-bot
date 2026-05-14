@@ -1,935 +1,338 @@
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
+import json
 import os
+import re
 from datetime import datetime, timezone
-from pymongo import MongoClient
 
-TOKEN = os.getenv('DISCORD_TOKEN')
-
-# ── MongoDB ────────────────────────────────────────────────────────────────────
-_mongo = MongoClient(os.getenv('MONGO_URI'))
-_col   = _mongo['botpy']['guilds']
-
-def load():
-    """Return {gid: gdata} for all guilds (used by background tasks)."""
-    return {doc['_id']: {k: v for k, v in doc.items() if k != '_id'} for doc in _col.find()}
-
-def save(all_data):
-    """Bulk-save all guild data (used by background tasks)."""
-    for gid, gdata in all_data.items():
-        _col.update_one({'_id': gid}, {'$set': gdata}, upsert=True)
-
-def guild_data(gid):
-    doc = _col.find_one({'_id': gid})
-    if doc is None:
-        gdata = {'players': {}, 'matches': [], 'queue': [], 'pending_matches': [], 'settings': {}, 'match_counter': 0, 'active_refs': {}}
-        _col.insert_one({'_id': gid, **gdata})
-        return gdata
-    return {k: v for k, v in doc.items() if k != '_id'}
-
-def save_guild(gid, gdata):
-    _col.update_one({'_id': gid}, {'$set': gdata}, upsert=True)
-# ──────────────────────────────────────────────────────────────────────────────
-
-RANKS = [
-    (0,    'Bronze',   '🥉', discord.Colour.from_rgb(205, 127, 50)),
-    (600,  'Silver',   '🥈', discord.Colour.from_rgb(192, 192, 192)),
-    (800,  'Gold',     '🥇', discord.Colour.from_rgb(255, 215, 0)),
-    (1000, 'Platinum', '💎', discord.Colour.from_rgb(100, 200, 255)),
-    (1200, 'Diamond',  '💠', discord.Colour.from_rgb(180, 100, 255)),
-]
-REGIONS      = ['EU', 'NA', 'SA', 'AS', 'OCE']
-BANNER_NAMES = ['Twilight Trio', 'Legacy', 'Sky Diver', 'Kingdom Hearts II', 'Beach Day', 'Clock Tower']
-K = 32
-
-def get_rank(elo):
-    rank = RANKS[0]
-    for r in RANKS:
-        if elo >= r[0]: rank = r
-    return rank
-
-def get_rank_index(elo):
-    idx = 0
-    for i, r in enumerate(RANKS):
-        if elo >= r[0]: idx = i
-    return idx
-
-def expected_score(a, b): return 1 / (1 + 10 ** ((b - a) / 400))
-
-def new_elos(winner_elo, loser_elo, winner_score=5, loser_score=0, same_region=True):
-    e = expected_score(winner_elo, loser_elo)
-    base_gain = round(K * (1 - e))
-    base_loss = round(K * e)
-
-    # Score margin modifier
-    score_diff = max(0, winner_score - loser_score)
-    if score_diff >= 5:   margin = 1.3
-    elif score_diff >= 4: margin = 1.15
-    elif score_diff >= 3: margin = 1.0
-    elif score_diff >= 2: margin = 0.9
-    else:                 margin = 0.8
-
-    # Region modifier (cross-region = slightly less ELO)
-    region_mod = 1.0 if same_region else 0.85
-
-    # Rank difference modifier
-    w_rank = get_rank_index(winner_elo)
-    l_rank = get_rank_index(loser_elo)
-    rank_diff = l_rank - w_rank  # positive = winner was lower rank
-    if rank_diff > 0:   rank_mod = 1.2
-    elif rank_diff < 0: rank_mod = 0.85
-    else:               rank_mod = 1.0
-
-    gained = max(10, round(base_gain * margin * region_mod * rank_mod))
-    lost   = max(5,  round(base_loss * margin * region_mod * rank_mod))
-    return winner_elo + gained, loser_elo - lost, gained, lost
-
-def get_player(gdata, uid): return gdata['players'].get(uid)
-
-def default_player(uid, name):
-    return {'uid': uid, 'name': name, 'elo': 500, 'wins': 0, 'losses': 0, 'kills': 0, 'deaths': 0, 'matches': [], 'banner': -1, 'registered_at': datetime.now(timezone.utc).isoformat()}
-
-def match_score(p1, p2):
-    elo_diff = abs(p1['elo'] - p2['elo'])
-    kda1 = p1['kills'] / max(1, p1['deaths'])
-    kda2 = p2['kills'] / max(1, p2['deaths'])
-    kda_diff = abs(kda1 - kda2)
-    region_bonus = 0 if p1['region'] == p2['region'] else 200
-    return elo_diff + kda_diff * 50 + region_bonus
+TOKEN     = os.getenv('DISCORD_TOKEN')
+DATA_FILE = 'guilds.json'
+AUTO_POST_WEEKDAY = 2
+AUTO_POST_HOUR    = 12
 
 intents = discord.Intents.default()
 intents.members = True
-intents.voice_states = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-def build_ref_embed(gdata):
-    pending = gdata.get('pending_matches', [])
-    embed = discord.Embed(title="🎮  Referee Board", description="Click your region to claim a pending match.\nA match won't start until a ref claims it.", colour=discord.Colour.from_rgb(255, 165, 0))
-    for region in REGIONS:
-        rp = [m for m in pending if m['region'] == region and m['status'] == 'waiting_for_ref']
-        count = len(rp)
-        if count == 1:  val = "⚔️  **1 game** needs a ref\n*Click to claim!*"
-        elif count > 1: val = f"⚔️  **{count} games** need a ref\n*Click to claim!*"
-        else:           val = "*No pending matches*"
-        embed.add_field(name=f"🌍  {region}", value=val, inline=True)
-    embed.set_footer(text="Only players with the Ref role can claim matches")
+def load_all():
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_all(data):
+    with open(DATA_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
+
+def default_sheet():
+    return {'channel_id': None, 'broadcaster': None, 'commentators': [], 'staff': [], 'message_id': None, 'lock_at': None, 'locked': False, 'title': '', 'description': ''}
+
+def get_sheet(guild_id, sheet):
+    return load_all().get(guild_id, {}).get(sheet, default_sheet())
+
+def save_sheet(guild_id, sheet, data):
+    all_data = load_all()
+    if guild_id not in all_data: all_data[guild_id] = {}
+    all_data[guild_id][sheet] = data
+    save_all(all_data)
+
+def save_guild_meta(guild_id, meta):
+    all_data = load_all()
+    if guild_id not in all_data: all_data[guild_id] = {}
+    all_data[guild_id].update(meta)
+    save_all(all_data)
+
+def build_embed(data, sheet_label):
+    locked  = data.get('locked', False)
+    lock_at = data.get('lock_at')
+    title   = data.get('title') or sheet_label
+    desc    = data.get('description', '')
+    close_text = f"\n\U0001f550 {'Closed at' if locked else 'Closes'}: {lock_at}" if lock_at else ""
+    body = f"{desc}{close_text}".strip() or ("\u007e\u007eSign-ups are now closed.\u007e\u007e" if locked else "Click a button below to claim your role!")
+    embed = discord.Embed(title=f"{'🔒' if locked else '📅'}  {title}", description=body, colour=discord.Colour.red() if locked else discord.Colour.blurple())
+    embed.add_field(name=f"📡  Broadcaster  [{'1/1' if data['broadcaster'] else '0/1'}]", value=f"✅ <@{data['broadcaster']}>" if data['broadcaster'] else "*Open — be the first!*", inline=False)
+    embed.add_field(name=f"🎙️  Commentators  [{len(data['commentators'])}]", value="\n".join(f"• <@{u}>" for u in data['commentators']) or "*No signups yet*", inline=False)
+    embed.add_field(name=f"🛠️  Staff  [{len(data['staff'])}]", value="\n".join(f"• <@{u}>" for u in data['staff']) or "*No signups yet*", inline=False)
+    embed.set_footer(text="Sign-ups reset each week  •  You can hold multiple roles")
     embed.timestamp = datetime.now(timezone.utc)
     return embed
 
-class RefBoardView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-        for region in REGIONS:
-            btn = discord.ui.Button(label=f"Ref {region}", style=discord.ButtonStyle.primary, custom_id=f"ref_region_{region}")
-            btn.callback = self._make_callback(region)
-            self.add_item(btn)
+def make_view(sheet_key, event_label):
+    class SignupView(discord.ui.View):
+        SHEET = sheet_key
+        def __init__(self): super().__init__(timeout=None)
+        def _role(self, m, *names): return any(n.lower() in {r.name.lower() for r in m.roles} for n in names)
+        async def _refresh(self, interaction, data):
+            try:
+                ch = interaction.channel if str(interaction.channel_id) == str(data.get('channel_id')) else await interaction.client.fetch_channel(int(data['channel_id']))
+                msg = await ch.fetch_message(int(data['message_id']))
+                print(f"[Refresh] sheet={self.SHEET}, message_id={data['message_id']}, channel_id={data['channel_id']}")
+                await msg.edit(embed=build_embed(data, "The Games" if self.SHEET == 'tg' else "ZeroC"))
+            except Exception as e: print(f"[Refresh error] sheet={self.SHEET}, error={e}, message_id={data.get('message_id')}")
 
-    def _make_callback(self, region):
-        async def callback(interaction: discord.Interaction):
-            gid = str(interaction.guild_id)
-            gdata = guild_data(gid)
-            ref_role = gdata.get('settings', {}).get('ref_role', 'Ref')
-            is_ref = any(r.name.lower() == ref_role.lower() for r in interaction.user.roles)
-            if not is_ref and not interaction.permissions.administrator:
-                await interaction.response.send_message(f"❌  You need the **{ref_role}** role.", ephemeral=True); return
+        @discord.ui.button(label=f'📡 Broadcaster — {event_label}', style=discord.ButtonStyle.danger, custom_id=f'sb_{sheet_key}')
+        async def btn_bc(self, interaction, button):
+            if not self._role(interaction.user, 'The Broadcasters'):
+                await interaction.response.send_message("❌  You need the **The Broadcasters** role.", ephemeral=True); return
+            data = get_sheet(str(interaction.guild_id), self.SHEET)
+            if data.get('locked'): await interaction.response.send_message("🔒  Sign-ups are closed.", ephemeral=True); return
             uid = str(interaction.user.id)
-            if uid in gdata.get('active_refs', {}):
-                await interaction.response.send_message("❌  You're already assigned to a match!", ephemeral=True); return
-            match = next((m for m in gdata.get('pending_matches', []) if m['region'] == region and m['status'] == 'waiting_for_ref'), None)
-            if not match:
-                await interaction.response.send_message(f"❌  No pending matches in **{region}** right now.", ephemeral=True); return
-            match['status'] = 'ref_claimed'
-            match['ref_uid'] = uid
-            gdata.setdefault('active_refs', {})[uid] = match['id']
-            save_guild(gid, gdata)
-            thread, vc = await create_match(interaction.guild, gdata, match, uid)
-            vc_mention     = f"<#{vc.id}>"     if vc     else "N/A"
-            thread_mention = f"<#{thread.id}>" if thread else "N/A"
-            await interaction.response.send_message(f"✅  You've claimed **Match #{match['id']}** in **{region}**!\n📝 Thread: {thread_mention}\n🎤 VC: {vc_mention}", ephemeral=True)
-            gdata2 = guild_data(gid)
-            await update_ref_board(interaction.guild, gdata2, gdata2.get('settings', {}))
-        return callback
+            if data['broadcaster'] == uid: await interaction.response.send_message("Already signed up as Broadcaster!", ephemeral=True); return
+            if data['broadcaster']: await interaction.response.send_message(f"Slot taken by <@{data['broadcaster']}>!", ephemeral=True); return
+            data['broadcaster'] = uid; save_sheet(str(interaction.guild_id), self.SHEET, data)
+            await self._refresh(interaction, data); await interaction.response.send_message("✅  Signed up as **Broadcaster**!", ephemeral=True)
 
-async def update_ref_board(guild, gdata, settings):
-    msg_id = settings.get('ref_message_id')
-    ch_id  = settings.get('ref_channel_id')
-    if not msg_id or not ch_id: return
-    try:
-        ch  = await bot.fetch_channel(int(ch_id))
-        msg = await ch.fetch_message(int(msg_id))
-        await msg.edit(embed=build_ref_embed(gdata), view=RefBoardView())
-    except Exception as e: print(f"[RefBoard update error] {e}")
+        @discord.ui.button(label=f'🎙️ Commentator — {event_label}', style=discord.ButtonStyle.primary, custom_id=f'sc_{sheet_key}')
+        async def btn_co(self, interaction, button):
+            if not self._role(interaction.user, 'The Commentators'):
+                await interaction.response.send_message("❌  You need the **The Commentators** role.", ephemeral=True); return
+            data = get_sheet(str(interaction.guild_id), self.SHEET)
+            if data.get('locked'): await interaction.response.send_message("🔒  Sign-ups are closed.", ephemeral=True); return
+            uid = str(interaction.user.id)
+            if uid in data['commentators']: await interaction.response.send_message("Already signed up as Commentator!", ephemeral=True); return
+            data['commentators'].append(uid); save_sheet(str(interaction.guild_id), self.SHEET, data)
+            await self._refresh(interaction, data); await interaction.response.send_message("✅  Signed up as **Commentator**!", ephemeral=True)
 
-class EndGameView(discord.ui.View):
-    def __init__(self, match_id):
-        super().__init__(timeout=None)
-        self.match_id = match_id
+        @discord.ui.button(label=f'🛠️ Staff — {event_label}', style=discord.ButtonStyle.success, custom_id=f'ss_{sheet_key}')
+        async def btn_st(self, interaction, button):
+            if not self._role(interaction.user, 'The Peacekeepers', 'The Authority'):
+                await interaction.response.send_message("❌  You need **The Peacekeepers** or **The Authority** role.", ephemeral=True); return
+            data = get_sheet(str(interaction.guild_id), self.SHEET)
+            is_pk = self._role(interaction.user, 'The Peacekeepers')
+            if data.get('locked') and not is_pk: await interaction.response.send_message("🔒  Sign-ups are closed.", ephemeral=True); return
+            uid = str(interaction.user.id)
+            if uid in data['staff']: await interaction.response.send_message("Already signed up as Staff!", ephemeral=True); return
+            data['staff'].append(uid); save_sheet(str(interaction.guild_id), self.SHEET, data)
+            await self._refresh(interaction, data); await interaction.response.send_message("✅  Signed up as **Staff**!", ephemeral=True)
 
-    @discord.ui.button(label='🔒 Close Game', style=discord.ButtonStyle.danger, custom_id='end_game')
-    async def btn_end(self, interaction: discord.Interaction, button: discord.ui.Button):
-        gid   = str(interaction.guild_id)
-        gdata = guild_data(gid)
-        ref_role = gdata.get('settings', {}).get('ref_role', 'Ref')
-        is_ref = any(r.name.lower() == ref_role.lower() for r in interaction.user.roles)
-        if not is_ref and not interaction.permissions.administrator:
-            await interaction.response.send_message("❌  Only refs can close the game.", ephemeral=True); return
-        match = next((m for m in gdata['matches'] if m['id'] == self.match_id), None)
-        if not match:
-            await interaction.response.send_message("❌  Match not found.", ephemeral=True); return
-        if match['status'] == 'completed':
-            await interaction.response.send_message("❌  Match already closed.", ephemeral=True); return
-        if match['status'] != 'score_confirmed':
-            await interaction.response.send_message("❌  You must run `/confirm-result` with a screenshot before closing the game.", ephemeral=True); return
+        @discord.ui.button(label='🔒 Lock', style=discord.ButtonStyle.danger, custom_id=f'lk_{sheet_key}')
+        async def btn_lock(self, interaction, button):
+            if not interaction.permissions.administrator: await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
+            data = get_sheet(str(interaction.guild_id), self.SHEET)
+            if data.get('locked'): await interaction.response.send_message("Already locked.", ephemeral=True); return
+            data['locked'] = True; save_sheet(str(interaction.guild_id), self.SHEET, data)
+            await self._refresh(interaction, data); await interaction.response.send_message("🔒  Locked.", ephemeral=True)
 
-        match['status'] = 'completed'
-        save_guild(gid, gdata)
+        @discord.ui.button(label='🔓 Unlock', style=discord.ButtonStyle.success, custom_id=f'ul_{sheet_key}')
+        async def btn_unlock(self, interaction, button):
+            if not interaction.permissions.administrator: await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
+            data = get_sheet(str(interaction.guild_id), self.SHEET)
+            if not data.get('locked'): await interaction.response.send_message("Already unlocked.", ephemeral=True); return
+            data['locked'] = False; save_sheet(str(interaction.guild_id), self.SHEET, data)
+            await self._refresh(interaction, data); await interaction.response.send_message("🔓  Unlocked.", ephemeral=True)
 
-        # Delete VC
-        if match.get('vc_id'):
-            try:
-                vc = bot.get_channel(int(match['vc_id'])) or await bot.fetch_channel(int(match['vc_id']))
-                if vc: await vc.delete()
-            except Exception as e: print(f"[VC delete error] {e}")
+        @discord.ui.button(label='❌ Remove my signup', style=discord.ButtonStyle.secondary, custom_id=f'rm_{sheet_key}')
+        async def btn_remove(self, interaction, button):
+            data = get_sheet(str(interaction.guild_id), self.SHEET)
+            uid = str(interaction.user.id)
+            is_pk = self._role(interaction.user, 'The Peacekeepers')
+            if data.get('locked') and not is_pk: await interaction.response.send_message("🔒  Sign-ups are closed.", ephemeral=True); return
+            was = data['broadcaster'] == uid or uid in data['commentators'] or uid in data['staff']
+            if not was: await interaction.response.send_message("No active signup found.", ephemeral=True); return
+            if data['broadcaster'] == uid: data['broadcaster'] = None
+            if uid in data['commentators']: data['commentators'].remove(uid)
+            if uid in data['staff']: data['staff'].remove(uid)
+            save_sheet(str(interaction.guild_id), self.SHEET, data)
+            await self._refresh(interaction, data); await interaction.response.send_message("✅  Signup removed.", ephemeral=True)
 
-        # Delete thread
-        if match.get('thread_id'):
-            try:
-                t = await bot.fetch_channel(int(match['thread_id']))
-                await t.delete()
-            except Exception as e: print(f"[Thread delete error] {e}")
+    SignupView.__name__ = f'SignupView_{sheet_key}'
+    return SignupView
 
-        await interaction.response.send_message("✅  Game closed. VC and thread deleted.", ephemeral=True)
-        await update_ref_board(interaction.guild, guild_data(gid), guild_data(gid).get('settings', {}))
+SignupViewTG = make_view('tg', 'The Games')
+SignupViewZC = make_view('zc', 'ZeroC')
 
-async def create_match(guild, gdata, pending, ref_uid):
-    gid      = str(guild.id)
-    settings = gdata.get('settings', {})
-    ch_id    = settings.get('queue_channel_id')
-    if not ch_id: return None, None
-    try:
-        channel  = await bot.fetch_channel(int(ch_id))
-        match_id = pending['id']
-        p1_q     = pending['p1_data']
-        p2_q     = pending['p2_data']
-
-        thread = await channel.create_thread(name=f"Match #{match_id} | {p1_q['name']} vs {p2_q['name']}", type=discord.ChannelType.private_thread, invitable=False)
-        for uid in [p1_q['uid'], p2_q['uid'], ref_uid]:
-            try:
-                m = guild.get_member(int(uid)) or await guild.fetch_member(int(uid))
-                await thread.add_user(m)
-            except Exception: pass
-
-        vc = None
-        try:
-            cat_id   = settings.get('vc_category_id')
-            category = guild.get_channel(int(cat_id)) if cat_id else None
-            overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False, connect=False)}
-            for uid in [p1_q['uid'], p2_q['uid'], ref_uid]:
-                try:
-                    m = guild.get_member(int(uid)) or await guild.fetch_member(int(uid))
-                    overwrites[m] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
-                except Exception: pass
-            vc = await guild.create_voice_channel(name=f"Match #{match_id} — {p1_q['name']} vs {p2_q['name']}", category=category, overwrites=overwrites)
-        except Exception as e: print(f"[VC create error] {e}")
-
-        if vc:
-            for uid in [p1_q['uid'], p2_q['uid']]:
-                try:
-                    m = guild.get_member(int(uid)) or await guild.fetch_member(int(uid))
-                    if m.voice: await m.move_to(vc)
-                except Exception: pass
-
-        _, r1, e1, _ = get_rank(p1_q['elo'])
-        _, r2, e2, _ = get_rank(p2_q['elo'])
-        ref_m = guild.get_member(int(ref_uid)) or await guild.fetch_member(int(ref_uid))
-
-        embed = discord.Embed(title=f"⚔️  Match #{match_id} — First to 5", description=(
-            f"**{p1_q['name']}** {e1} {r1} ({p1_q['elo']} ELO)\nvs\n"
-            f"**{p2_q['name']}** {e2} {r2} ({p2_q['elo']} ELO)\n\n"
-            f"🌍 Region: **{p1_q['region']}**\n"
-            f"👮 Ref: **{ref_m.display_name}**\n"
-            + (f"🎤 VC: <#{vc.id}>\n" if vc else "") +
-            "\n📸 Post a screenshot when done. Ref clicks **End Game** to close."
-        ), colour=discord.Colour.gold())
-        embed.set_footer(text=f"Match ID: {match_id}")
-        embed.timestamp = datetime.now(timezone.utc)
-        await thread.send(embed=embed, view=EndGameView(match_id))
-
-        for uid in [p1_q['uid'], p2_q['uid']]:
-            try:
-                m = guild.get_member(int(uid)) or await guild.fetch_member(int(uid))
-                await m.send(f"🎮  **Match found!** (Match #{match_id})\n📝 Thread: <#{thread.id}>\n" + (f"🎤 VC: <#{vc.id}>" if vc else ""))
-            except Exception: pass
-
-        gdata2 = guild_data(gid)
-        gdata2['matches'].append({'id': match_id, 'p1': p1_q['uid'], 'p2': p2_q['uid'], 'p1_name': p1_q['name'], 'p2_name': p2_q['name'], 'p1_elo': p1_q['elo'], 'p2_elo': p2_q['elo'], 'region': p1_q['region'], 'ref_uid': ref_uid, 'status': 'ongoing', 'winner': None, 'p1_score': 0, 'p2_score': 0, 'thread_id': str(thread.id), 'vc_id': str(vc.id) if vc else None, 'created_at': datetime.now(timezone.utc).isoformat()})
-        gdata2['pending_matches'] = [m for m in gdata2.get('pending_matches', []) if m['id'] != match_id]
-        save_guild(gid, gdata2)
-        return thread, vc
-    except Exception as e:
-        print(f"[create_match error] {e}")
-        return None, None
-
-@bot.event
-async def on_voice_state_update(member, before, after):
-    gid   = str(member.guild.id)
-    gdata = guild_data(gid)
-    uid   = str(member.id)
-    q_vc  = gdata.get('settings', {}).get('queue_vc_id')
-
-    if before.channel and q_vc and str(before.channel.id) == str(q_vc):
-        in_match = any(m['status'] == 'ongoing' and uid in (m['p1'], m['p2']) for m in gdata.get('matches', []))
-        if not in_match:
-            gdata['queue'] = [q for q in gdata.get('queue', []) if q['uid'] != uid]
-            cancelled = [m for m in gdata.get('pending_matches', []) if uid in (m['p1'], m['p2']) and m['status'] == 'waiting_for_ref']
-            gdata['pending_matches'] = [m for m in gdata.get('pending_matches', []) if m not in cancelled]
-            save_guild(gid, gdata)
-            try: await member.send("❌  You left the queue VC and were removed from the queue.")
-            except Exception: pass
-            for m in cancelled:
-                other_uid = m['p2'] if uid == m['p1'] else m['p1']
-                try:
-                    other = member.guild.get_member(int(other_uid)) or await member.guild.fetch_member(int(other_uid))
-                    await other.send(f"❌  Your opponent left so **Match #{m['id']}** has been cancelled. You've been put back in the queue!")
-                    other_player = get_player(gdata, other_uid)
-                    if other_player:
-                        gdata2 = guild_data(gid)
-                        gdata2.setdefault('queue', []).append({'uid': other_uid, 'name': other_player['name'], 'elo': other_player['elo'], 'region': m['region'], 'kills': other_player['kills'], 'deaths': other_player['deaths'], 'queued_at': datetime.now(timezone.utc).isoformat()})
-                        save_guild(gid, gdata2)
-                except Exception: pass
-            await update_ref_board(member.guild, guild_data(gid), guild_data(gid).get('settings', {}))
-
-    if after.channel and q_vc and str(after.channel.id) == str(q_vc):
-        player = get_player(gdata, uid)
-        if not player:
-            try: await member.send("❌  You need to `/register` first!")
-            except Exception: pass
-            return
-        if any(q['uid'] == uid for q in gdata.get('queue', [])): return
-        if any(m['status'] == 'ongoing' and uid in (m['p1'], m['p2']) for m in gdata.get('matches', [])):
-            try: await member.send("❌  You're already in an ongoing match!")
-            except Exception: pass
-            return
-        region = None
-        member_roles = {r.name.upper() for r in member.roles}
-        for r in REGIONS:
-            if r in member_roles: region = r; break
-        if not region: region = gdata.get('settings', {}).get('default_region', 'EU')
-        gdata.setdefault('queue', []).append({'uid': uid, 'name': player['name'], 'elo': player['elo'], 'region': region, 'kills': player['kills'], 'deaths': player['deaths'], 'queued_at': datetime.now(timezone.utc).isoformat()})
-        save_guild(gid, gdata)
-        await try_make_match(gid, gdata)
-
-async def try_make_match(gid, gdata):
-    queue = gdata.get('queue', [])
-    if len(queue) < 2: return
-    best_score = float('inf')
-    matched = None
-    for i in range(len(queue)):
-        for j in range(i + 1, len(queue)):
-            qi_wait = (datetime.now(timezone.utc) - datetime.fromisoformat(queue[i]['queued_at'])).total_seconds()
-            qj_wait = (datetime.now(timezone.utc) - datetime.fromisoformat(queue[j]['queued_at'])).total_seconds()
-            if queue[i]['region'] != queue[j]['region'] and qi_wait < 180 and qj_wait < 180: continue
-            score = match_score(queue[i], queue[j])
-            if score < best_score: best_score = score; matched = (i, j)
-    if not matched: return
-    i, j = matched
-    p1_q, p2_q = queue[i], queue[j]
-    for idx in sorted([i, j], reverse=True): queue.pop(idx)
-    gdata['queue'] = queue
-    gdata['match_counter'] = gdata.get('match_counter', 0) + 1
-    mid = gdata['match_counter']
-    pending = {'id': mid, 'p1': p1_q['uid'], 'p2': p2_q['uid'], 'p1_name': p1_q['name'], 'p2_name': p2_q['name'], 'p1_elo': p1_q['elo'], 'p2_elo': p2_q['elo'], 'region': p1_q['region'], 'status': 'waiting_for_ref', 'p1_data': p1_q, 'p2_data': p2_q, 'created_at': datetime.now(timezone.utc).isoformat()}
-    gdata.setdefault('pending_matches', []).append(pending)
-    save_guild(gid, gdata)
-    guild = next((g for g in bot.guilds if str(g.id) == gid), None)
-    if guild: await update_ref_board(guild, gdata, gdata.get('settings', {}))
+async def post_signup(channel, guild_id, sheet, title, description, lock_at=None):
+    label = "The Games" if sheet == 'tg' else "ZeroC"
+    data = {'channel_id': str(channel.id), 'broadcaster': None, 'commentators': [], 'staff': [], 'message_id': None, 'lock_at': lock_at, 'locked': False, 'title': title or label, 'description': description or ''}
+    save_sheet(guild_id, sheet, data)
+    view = SignupViewTG() if sheet == 'tg' else SignupViewZC()
+    msg = await channel.send(embed=build_embed(data, label), view=view)
+    data['message_id'] = str(msg.id); save_sheet(guild_id, sheet, data)
 
 @tasks.loop(minutes=1)
-async def queue_expand_task():
+async def auto_lock_task():
     now = datetime.now(timezone.utc)
-    all_data = load()
-    for gid, gdata in all_data.items():
-        queue = gdata.get('queue', [])
-        changed = False
-        for entry in queue:
-            if (now - datetime.fromisoformat(entry['queued_at'])).total_seconds() >= 180 and not entry.get('expanded'):
-                entry['expanded'] = True; changed = True
-        if changed: gdata['queue'] = queue; all_data[gid] = gdata
-    save(all_data)
-    for gid, gdata in all_data.items(): await try_make_match(gid, gdata)
+    all_data = load_all()
+    for guild_id, gdata in all_data.items():
+        for sheet in ('tg', 'zc'):
+            sdata = gdata.get(sheet, {})
+            if not sdata or sdata.get('locked') or not sdata.get('lock_at'): continue
+            try:
+                raw = sdata['lock_at'].strip()
+                match = re.search(r'<t:(\d+)(?::[a-zA-Z])?>', raw)
+                lt = datetime.fromtimestamp(int(match.group(1)), tz=timezone.utc) if match else datetime.strptime(raw, '%d/%m/%Y %H:%M').replace(tzinfo=timezone.utc)
+                if now >= lt:
+                    sdata['locked'] = True; gdata[sheet] = sdata; all_data[guild_id] = gdata; save_all(all_data)
+                    if sdata.get('channel_id') and sdata.get('message_id'):
+                        ch = await bot.fetch_channel(int(sdata['channel_id']))
+                        msg = await ch.fetch_message(int(sdata['message_id']))
+                        await msg.edit(embed=build_embed(sdata, "The Games" if sheet == 'tg' else "ZeroC"))
+            except Exception as e: print(f"[AutoLock error] {e}")
 
-@queue_expand_task.before_loop
-async def before_expand(): await bot.wait_until_ready()
-
-@tasks.loop(minutes=5)
-async def leaderboard_update_task():
-    all_data = load()
-    for gid, gdata in all_data.items():
-        settings = gdata.get('settings', {})
-        if not settings.get('lb_message_id') or not settings.get('lb_channel_id'): continue
-        try:
-            ch  = await bot.fetch_channel(int(settings['lb_channel_id']))
-            msg = await ch.fetch_message(int(settings['lb_message_id']))
-            await msg.edit(embed=build_leaderboard_embed(gdata))
-        except Exception: pass
-
-@leaderboard_update_task.before_loop
-async def before_lb(): await bot.wait_until_ready()
-
-@tasks.loop(seconds=5)
-async def ref_board_update_task():
-    all_data = load()
-    for gid, gdata in all_data.items():
-        settings = gdata.get('settings', {})
-        if not settings.get('ref_message_id') or not settings.get('ref_channel_id'): continue
-        try:
-            ch  = await bot.fetch_channel(int(settings['ref_channel_id']))
-            msg = await ch.fetch_message(int(settings['ref_message_id']))
-            await msg.edit(embed=build_ref_embed(gdata), view=RefBoardView())
-        except Exception: pass
-
-@ref_board_update_task.before_loop
-async def before_ref_board(): await bot.wait_until_ready()
-
-def build_leaderboard_embed(gdata):
-    players = [(uid, p) for uid, p in gdata.get('players', {}).items() if p['wins'] + p['losses'] > 0]
-    players.sort(key=lambda x: x[1]['elo'], reverse=True)
-    top    = players[:10]
-    embed  = discord.Embed(title="🏆  Ranked Leaderboard — Top 10", colour=discord.Colour.gold())
-    medals = ['🥇', '🥈', '🥉']
-    if not top:
-        embed.description = "*No ranked players yet — play some matches!*"
-    else:
-        lines = []
-        for i, (uid, p) in enumerate(top):
-            _, rn, re_, _ = get_rank(p['elo'])
-            medal = medals[i] if i < 3 else f"`#{i+1}`"
-            total = p['wins'] + p['losses']
-            wr    = round(p['wins'] / total * 100) if total else 0
-            lines.append(f"{medal}  **{p['name']}**\n┣ {re_} {rn}  •  **{p['elo']} ELO**\n┗ {p['wins']}W  {p['losses']}L  •  {wr}% WR\n")
-        embed.description = "\n".join(lines)
-    embed.set_footer(text="Updates every 5 minutes  •  Last updated")
-    embed.timestamp = datetime.now(timezone.utc)
-    return embed
+@auto_lock_task.before_loop
+async def before_auto(): await bot.wait_until_ready()
 
 @bot.event
 async def on_ready():
     print(f"✅  Logged in as {bot.user}")
-    bot.add_view(RefBoardView())
+    bot.add_view(SignupViewTG()); bot.add_view(SignupViewZC())
     try:
         synced = await bot.tree.sync()
         print(f"✅  Synced {len(synced)} commands: {[c.name for c in synced]}")
     except Exception as e: print(f"❌  Sync failed: {e}")
-    queue_expand_task.start()
-    leaderboard_update_task.start()
-    ref_board_update_task.start()
-    print("✅  Bot ready")
+    auto_lock_task.start()
 
-@bot.tree.command(name="register", description="Register to play ranked 1v1s")
-async def cmd_register(interaction: discord.Interaction):
+@bot.tree.command(name="setup-thegames", description="Set channel for The Games sign-ups — run IN the channel (Admin only)")
+async def cmd_setup_tg(interaction: discord.Interaction):
     try:
-        gid, uid = str(interaction.guild_id), str(interaction.user.id)
-        gdata = guild_data(gid)
-        if uid in gdata['players']:
-            await interaction.response.send_message("❌  You're already registered!", ephemeral=True); return
-        gdata['players'][uid] = default_player(uid, interaction.user.display_name)
-        save_guild(gid, gdata)
-        _, rn, re_, colour = get_rank(500)
-        embed = discord.Embed(title="✅  Registered!", description=f"Welcome, **{interaction.user.display_name}**!\n\nStarting ELO: **500** | Rank: {re_} **{rn}**\n\nJoin the queue VC to find a match!", colour=colour)
-        await interaction.response.send_message(embed=embed)
+        if not interaction.permissions.administrator: await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
+        data = get_sheet(str(interaction.guild_id), 'tg'); data['channel_id'] = str(interaction.channel_id)
+        save_sheet(str(interaction.guild_id), 'tg', data)
+        await interaction.response.send_message(f"✅  The Games channel set to <#{interaction.channel_id}>!", ephemeral=True)
     except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
 
-@bot.tree.command(name="profile", description="View your player card or another player's")
-@app_commands.describe(user="The player to look up (leave empty for yourself)")
-async def cmd_profile(interaction: discord.Interaction, user: discord.Member = None):
+@bot.tree.command(name="setup-zeroc", description="Set channel for ZeroC sign-ups — run IN the channel (Admin only)")
+async def cmd_setup_zc(interaction: discord.Interaction):
     try:
-        gid    = str(interaction.guild_id)
-        target = user or interaction.user
-        uid    = str(target.id)
-        gdata  = guild_data(gid)
-        player = get_player(gdata, uid)
-        if not player:
-            await interaction.response.send_message(f"❌  **{target.display_name}** is not registered.", ephemeral=True); return
-        _, rank_name, rank_emoji, colour = get_rank(player['elo'])
-        total  = player['wins'] + player['losses']
-        wr     = round(player['wins'] / total * 100) if total else 0
-        kda    = round(player['kills'] / max(1, player['deaths']), 2)
-        streak = player.get('streak', 0)
-        streak_str = f"🔥 {streak}" if streak > 1 else ("❄️ " + str(abs(streak)) if streak < -1 else "—")
-        embed  = discord.Embed(colour=colour)
-        embed.set_author(name=f"{target.display_name}  •  Player Card", icon_url=target.display_avatar.url)
-        embed.set_thumbnail(url=target.display_avatar.url)
-        banners    = gdata.get('settings', {}).get('banners', [])
-        banner_idx = player.get('banner', -1)
-        if 0 <= banner_idx < len(banners) and banners[banner_idx]:
-            embed.set_image(url=banners[banner_idx])
-        embed.add_field(name="Rank:",     value=f"`{rank_emoji} {rank_name}`", inline=True)
-        embed.add_field(name="ELO:",      value=f"`{player['elo']}`",          inline=True)
-        embed.add_field(name="Streak:",   value=f"`{streak_str}`",             inline=True)
-        embed.add_field(name="Wins:",     value=f"`{player['wins']}`",         inline=True)
-        embed.add_field(name="Losses:",   value=f"`{player['losses']}`",       inline=True)
-        embed.add_field(name="Win Rate:", value=f"`{wr}%`",                    inline=True)
-        embed.add_field(name="Kills:",    value=f"`{player['kills']}`",        inline=True)
-        embed.add_field(name="Deaths:",   value=f"`{player['deaths']}`",       inline=True)
-        embed.add_field(name="KDA:",      value=f"`{kda}`",                    inline=True)
-        embed.set_footer(text=f"Registered {player['registered_at'][:10]}  •  {total} matches played")
-        await interaction.response.send_message(embed=embed)
+        if not interaction.permissions.administrator: await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
+        data = get_sheet(str(interaction.guild_id), 'zc'); data['channel_id'] = str(interaction.channel_id)
+        save_sheet(str(interaction.guild_id), 'zc', data)
+        await interaction.response.send_message(f"✅  ZeroC channel set to <#{interaction.channel_id}>!", ephemeral=True)
     except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
 
-@bot.tree.command(name="set-banner", description="Choose your profile banner")
-@app_commands.describe(banner="Which banner to use")
-@app_commands.choices(banner=[app_commands.Choice(name=f"{i+1} - {n}", value=i) for i, n in enumerate(BANNER_NAMES)])
-async def cmd_set_banner(interaction: discord.Interaction, banner: int):
+@bot.tree.command(name="post-thegames", description="Post The Games sign-up sheet (Admin only)")
+@app_commands.describe(title="Title for the sign-up", description="Description shown on the sheet", lock_at="Auto-lock time (Discord @time or DD/MM/YYYY HH:MM)")
+async def cmd_post_tg(interaction: discord.Interaction, title: str = 'The Games', description: str = '', lock_at: str = None):
     try:
-        gid, uid = str(interaction.guild_id), str(interaction.user.id)
-        gdata  = guild_data(gid)
-        player = get_player(gdata, uid)
-        if not player:
-            await interaction.response.send_message("❌  You need to `/register` first!", ephemeral=True); return
-        banners = gdata.get('settings', {}).get('banners', [])
-        if banner >= len(banners) or not banners[banner]:
-            await interaction.response.send_message(f"❌  Banner **{BANNER_NAMES[banner]}** hasn't been set up yet.", ephemeral=True); return
-        gdata['players'][uid]['banner'] = banner
-        save_guild(gid, gdata)
-        await interaction.response.send_message(f"✅  Banner set to **{BANNER_NAMES[banner]}**!", ephemeral=True)
+        if not interaction.permissions.administrator: await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
+        await post_signup(interaction.channel, str(interaction.guild_id), 'tg', title, description, lock_at)
+        await interaction.response.send_message("✅  The Games sign-up posted!", ephemeral=True)
     except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
 
-@bot.tree.command(name="match-history", description="View recent match history")
-@app_commands.describe(user="Player to look up (leave empty for yourself)")
-async def cmd_history(interaction: discord.Interaction, user: discord.Member = None):
+@bot.tree.command(name="post-zeroc", description="Post ZeroC sign-up sheet (Admin only)")
+@app_commands.describe(title="Title for the sign-up", description="Description shown on the sheet", lock_at="Auto-lock time (Discord @time or DD/MM/YYYY HH:MM)")
+async def cmd_post_zc(interaction: discord.Interaction, title: str = 'ZeroC', description: str = '', lock_at: str = None):
     try:
-        gid    = str(interaction.guild_id)
-        target = user or interaction.user
-        uid    = str(target.id)
-        gdata  = guild_data(gid)
-        player = get_player(gdata, uid)
-        if not player:
-            await interaction.response.send_message(f"❌  **{target.display_name}** is not registered.", ephemeral=True); return
-        matches = [m for m in gdata['matches'] if m['status'] == 'completed' and uid in (m['p1'], m['p2'])]
-        matches.sort(key=lambda x: x.get('completed_at', ''), reverse=True)
-        recent = matches[:10]
-        if not recent:
-            await interaction.response.send_message(f"**{target.display_name}** has no completed matches yet.", ephemeral=True); return
-        embed = discord.Embed(title=f"📋  Match History — {target.display_name}", colour=discord.Colour.blurple())
-        lines = []
-        for m in recent:
-            won  = m['winner'] == uid
-            opp  = m['p2_name'] if uid == m['p1'] else m['p1_name']
-            my_s = m['p1_score'] if uid == m['p1'] else m['p2_score']
-            op_s = m['p2_score'] if uid == m['p1'] else m['p1_score']
-            lines.append(f"{'✅ **W**' if won else '❌ **L**'}  •  **#{m['id']}** vs **{opp}**  •  `{my_s}–{op_s}`  •  {m.get('completed_at','')[:10]}")
-        embed.description = "\n".join(lines)
-        await interaction.response.send_message(embed=embed)
+        if not interaction.permissions.administrator: await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
+        await post_signup(interaction.channel, str(interaction.guild_id), 'zc', title, description, lock_at)
+        await interaction.response.send_message("✅  ZeroC sign-up posted!", ephemeral=True)
     except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
 
-@bot.tree.command(name="queue-status", description="See who's in the queue and pending matches")
-async def cmd_queue_status(interaction: discord.Interaction):
+@bot.tree.command(name="remove-signup", description="Remove a user's signup by their Discord ID (Admin only)")
+@app_commands.describe(user_id="The Discord user ID to remove", sheet="Which sign-up sheet")
+@app_commands.choices(sheet=[app_commands.Choice(name="The Games", value="tg"), app_commands.Choice(name="ZeroC", value="zc")])
+async def cmd_remove_signup(interaction: discord.Interaction, user_id: str, sheet: str):
     try:
-        gid   = str(interaction.guild_id)
-        gdata = guild_data(gid)
-        queue   = gdata.get('queue', [])
-        pending = gdata.get('pending_matches', [])
-        embed = discord.Embed(title="🎮  Queue Status", colour=discord.Colour.green())
-        if queue:
-            lines = [f"`#{i+1}`  **{q['name']}**  •  {get_rank(q['elo'])[2]} {get_rank(q['elo'])[1]} ({q['elo']} ELO)  •  🌍 {q['region']}" for i, q in enumerate(queue)]
-            embed.add_field(name=f"⏳  In Queue — {len(queue)}", value="\n".join(lines), inline=False)
-        else:
-            embed.add_field(name="⏳  In Queue", value="*Empty*", inline=False)
-        if pending:
-            lines = [f"**#{m['id']}**  {m['p1_name']} vs {m['p2_name']}  •  🌍 {m['region']}  •  Waiting for ref" for m in pending]
-            embed.add_field(name=f"🔍  Waiting for Ref — {len(pending)}", value="\n".join(lines), inline=False)
-        await interaction.response.send_message(embed=embed)
-    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
-
-@bot.tree.command(name="active-matches", description="See all ongoing matches")
-async def cmd_active(interaction: discord.Interaction):
-    try:
-        gid     = str(interaction.guild_id)
-        gdata   = guild_data(gid)
-        ongoing = [m for m in gdata['matches'] if m['status'] == 'ongoing']
-        if not ongoing:
-            await interaction.response.send_message("No active matches right now.", ephemeral=True); return
-        embed = discord.Embed(title=f"⚔️  Active Matches — {len(ongoing)}", colour=discord.Colour.orange())
-        embed.description = "\n".join([f"**#{m['id']}**  •  {m['p1_name']} vs {m['p2_name']}  •  🌍 {m['region']}" for m in ongoing])
-        await interaction.response.send_message(embed=embed)
-    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
-
-@bot.tree.command(name="unclaim-match", description="Unclaim a match you are refereeing (Ref only)")
-@app_commands.describe(match_id="Match ID to unclaim")
-async def cmd_unclaim(interaction: discord.Interaction, match_id: int):
-    try:
-        gid   = str(interaction.guild_id)
-        gdata = guild_data(gid)
-        ref_role = gdata.get('settings', {}).get('ref_role', 'Ref')
-        is_ref = any(r.name.lower() == ref_role.lower() for r in interaction.user.roles)
-        if not is_ref and not interaction.permissions.administrator:
-            await interaction.response.send_message(f"❌  You need the **{ref_role}** role.", ephemeral=True); return
-        uid   = str(interaction.user.id)
-        match = next((m for m in gdata.get('pending_matches', []) if m['id'] == match_id), None)
-        if not match:
-            await interaction.response.send_message(f"❌  Match #{match_id} not found in pending matches.", ephemeral=True); return
-        if match.get('ref_uid') != uid and not interaction.permissions.administrator:
-            await interaction.response.send_message("❌  You didn't claim this match.", ephemeral=True); return
-        match['status'] = 'waiting_for_ref'
-        match.pop('ref_uid', None)
-        if uid in gdata.get('active_refs', {}): del gdata['active_refs'][uid]
-        save_guild(gid, gdata)
-        await update_ref_board(interaction.guild, gdata, gdata.get('settings', {}))
-        await interaction.response.send_message(f"✅  You've unclaimed **Match #{match_id}**. It's back in the queue for another ref.", ephemeral=True)
-    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
-
-@bot.tree.command(name="cancel-match", description="Cancel a match that cannot be completed (Ref only)")
-@app_commands.describe(match_id="Match ID to cancel", reason="Reason for cancellation")
-async def cmd_cancel_match(interaction: discord.Interaction, match_id: int, reason: str = "No reason given"):
-    try:
-        gid   = str(interaction.guild_id)
-        gdata = guild_data(gid)
-        ref_role = gdata.get('settings', {}).get('ref_role', 'Ref')
-        is_ref = any(r.name.lower() == ref_role.lower() for r in interaction.user.roles)
-        if not is_ref and not interaction.permissions.administrator:
-            await interaction.response.send_message(f"❌  You need the **{ref_role}** role.", ephemeral=True); return
-        match = next((m for m in gdata.get('matches', []) if m['id'] == match_id and m['status'] == 'ongoing'), None)
-        is_pending = False
-        if not match:
-            match = next((m for m in gdata.get('pending_matches', []) if m['id'] == match_id), None)
-            is_pending = True
-        if not match:
-            await interaction.response.send_message(f"❌  Match #{match_id} not found or already completed.", ephemeral=True); return
-        if match.get('vc_id'):
+        if not interaction.permissions.administrator: await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
+        data = get_sheet(str(interaction.guild_id), sheet)
+        was = data['broadcaster'] == user_id or user_id in data['commentators'] or user_id in data['staff']
+        if not was: await interaction.response.send_message(f"❌  No signup found for `{user_id}`.", ephemeral=True); return
+        if data['broadcaster'] == user_id: data['broadcaster'] = None
+        if user_id in data['commentators']: data['commentators'].remove(user_id)
+        if user_id in data['staff']: data['staff'].remove(user_id)
+        save_sheet(str(interaction.guild_id), sheet, data)
+        if data.get('channel_id') and data.get('message_id'):
             try:
-                vc = bot.get_channel(int(match['vc_id'])) or await bot.fetch_channel(int(match['vc_id']))
-                if vc: await vc.delete()
+                ch = await bot.fetch_channel(int(data['channel_id']))
+                msg = await ch.fetch_message(int(data['message_id']))
+                await msg.edit(embed=build_embed(data, "The Games" if sheet == 'tg' else "ZeroC"))
             except Exception: pass
-        if match.get('thread_id'):
+        await interaction.response.send_message(f"✅  Removed signup for <@{user_id}>.", ephemeral=True)
+    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
+
+@bot.tree.command(name="clear-signups", description="Clear all signups on a sheet (Admin only)")
+@app_commands.describe(sheet="Which sheet to clear")
+@app_commands.choices(sheet=[app_commands.Choice(name="The Games", value="tg"), app_commands.Choice(name="ZeroC", value="zc")])
+async def cmd_clear(interaction: discord.Interaction, sheet: str):
+    try:
+        if not interaction.permissions.administrator: await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
+        data = get_sheet(str(interaction.guild_id), sheet)
+        data['broadcaster'] = None; data['commentators'] = []; data['staff'] = []
+        save_sheet(str(interaction.guild_id), sheet, data)
+        if data.get('channel_id') and data.get('message_id'):
             try:
-                t = await bot.fetch_channel(int(match['thread_id']))
-                await t.delete()
+                ch = await bot.fetch_channel(int(data['channel_id']))
+                msg = await ch.fetch_message(int(data['message_id']))
+                await msg.edit(embed=build_embed(data, "The Games" if sheet == 'tg' else "ZeroC"))
             except Exception: pass
-        ref_uid = match.get('ref_uid')
-        if ref_uid and ref_uid in gdata.get('active_refs', {}): del gdata['active_refs'][ref_uid]
-        if is_pending:
-            gdata['pending_matches'] = [m for m in gdata.get('pending_matches', []) if m['id'] != match_id]
-        else:
-            match['status'] = 'cancelled'
-        save_guild(gid, gdata)
-        await update_ref_board(interaction.guild, gdata, gdata.get('settings', {}))
-        for uid in [match.get('p1'), match.get('p2')]:
-            if not uid: continue
-            try:
-                m = interaction.guild.get_member(int(uid)) or await interaction.guild.fetch_member(int(uid))
-                await m.send(f"❌  **Match #{match_id}** has been cancelled by a ref.\n📝 Reason: {reason}")
+        await interaction.response.send_message("✅  Signups cleared.", ephemeral=True)
+    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
+
+@bot.tree.command(name="view-signups", description="See who's signed up on a sheet")
+@app_commands.describe(sheet="Which sheet to view")
+@app_commands.choices(sheet=[app_commands.Choice(name="The Games", value="tg"), app_commands.Choice(name="ZeroC", value="zc")])
+async def cmd_view(interaction: discord.Interaction, sheet: str):
+    data = get_sheet(str(interaction.guild_id), sheet)
+    await interaction.response.send_message(embed=build_embed(data, "The Games" if sheet == 'tg' else "ZeroC"), ephemeral=True)
+
+class LOAModal(discord.ui.Modal, title='Leave of Absence Request'):
+    discord_name  = discord.ui.TextInput(label='Your Discord Name', placeholder='e.g. roxas', required=True)
+    events_missed = discord.ui.TextInput(label='How many upcoming events will you miss?', placeholder='e.g. 2', required=True)
+    reason        = discord.ui.TextInput(label='Reason', placeholder='Why will you be unavailable?', style=discord.TextStyle.paragraph, required=True)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            loa_ch_id = load_all().get(str(interaction.guild_id), {}).get('loa_channel_id')
+            if not loa_ch_id: await interaction.response.send_message("❌  No LOA channel set! Admin needs to run `/setup-loa` first.", ephemeral=True); return
+            ch = await bot.fetch_channel(int(loa_ch_id))
+            embed = discord.Embed(title="📋  Leave of Absence Request", description="Only visible to **The Capitol** and **Director**.", colour=discord.Colour.orange())
+            embed.add_field(name="👤  Discord Name",  value=self.discord_name.value,   inline=False)
+            embed.add_field(name="🎮  Events Missed", value=self.events_missed.value,  inline=True)
+            embed.add_field(name="📝  Reason",        value=self.reason.value,         inline=False)
+            embed.set_footer(text=f"Submitted by {interaction.user} (ID: {interaction.user.id})")
+            embed.timestamp = datetime.now(timezone.utc)
+            await ch.send(embed=embed)
+            await interaction.response.send_message("✅  LOA submitted! Only **The Capitol** and **Director** can see it.", ephemeral=True)
+        except Exception as e:
+            try: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
             except Exception: pass
-        embed = discord.Embed(title=f"🚫  Match #{match_id} — Cancelled", colour=discord.Colour.red())
-        embed.add_field(name="Players", value=f"<@{match['p1']}> vs <@{match['p2']}>", inline=True)
-        embed.add_field(name="Region",  value=match.get('region', '—'),                 inline=True)
-        embed.add_field(name="Reason",  value=reason,                                   inline=False)
-        embed.set_footer(text=f"Cancelled by {interaction.user.display_name}")
+
+@bot.tree.command(name="loa", description="Submit a Leave of Absence — only seen by The Capitol and Director")
+async def cmd_loa(interaction: discord.Interaction):
+    try:
+        allowed = {'staff', 'the peacekeepers', 'the authority'}
+        if not {r.name.lower() for r in interaction.user.roles}.intersection(allowed):
+            await interaction.response.send_message("❌  You need **Staff**, **The Peacekeepers**, or **The Authority** role.", ephemeral=True); return
+        await interaction.response.send_modal(LOAModal())
+    except Exception as e:
+        try: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
+        except Exception: pass
+
+@bot.tree.command(name="setup-loa", description="Set the LOA channel — run IN the channel (Admin only)")
+async def cmd_setup_loa(interaction: discord.Interaction):
+    try:
+        if not interaction.permissions.administrator: await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
+        save_guild_meta(str(interaction.guild_id), {'loa_channel_id': str(interaction.channel_id)})
+        await interaction.response.send_message(f"✅  LOA channel set to <#{interaction.channel_id}>!", ephemeral=True)
+    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
+
+@bot.tree.command(name="zeroc-schedule", description="Post the ZeroC schedule (Admin only)")
+@app_commands.describe(
+    eu_time="Discord @time for the EU ZeroC event",
+    na_time="Discord @time for the NA ZeroC event",
+    month="Month label (e.g. April, 2026) — defaults to current month",
+)
+async def cmd_schedule(interaction: discord.Interaction, eu_time: str, na_time: str, month: str = None):
+    try:
+        if not interaction.permissions.administrator:
+            await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
+        now = datetime.now(timezone.utc)
+        month_label = month or now.strftime("%B, %Y")
+        embed = discord.Embed(
+            title="🏆  ZeroC — Official Schedule",
+            description=f"### 📅  {month_label}",
+            colour=discord.Colour.from_rgb(255, 165, 0),
+        )
+        embed.add_field(name="🌍  EU Event", value=f"> {eu_time}\n> ZeroC EU Event", inline=False)
+        embed.add_field(name="🌎  NA Event", value=f"> {na_time}\n> ZeroC NA Event", inline=False)
+        embed.add_field(name="⏰  Time Zones", value="All times are automatically converted to your local time zone.", inline=False)
+        embed.set_footer(text="ZeroC Competitive")
         embed.timestamp = datetime.now(timezone.utc)
-        await interaction.response.send_message(embed=embed)
-        log_ch_id = gdata.get('settings', {}).get('log_channel_id')
-        if log_ch_id:
-            try: await (await bot.fetch_channel(int(log_ch_id))).send(embed=embed)
-            except Exception: pass
-    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
-
-@bot.tree.command(name="confirm-result", description="Confirm a match result with screenshot (Ref only)")
-@app_commands.default_permissions(administrator=True)
-@app_commands.describe(match_id="Match ID", winner_id="Discord user ID of the winner", p1_score="Player 1 score", p2_score="Player 2 score", screenshot="Screenshot of the match result")
-async def cmd_confirm(interaction: discord.Interaction, match_id: int, winner_id: str, p1_score: int, p2_score: int, screenshot: discord.Attachment):
-    try:
-        gid   = str(interaction.guild_id)
-        gdata = guild_data(gid)
-        ref_role = gdata.get('settings', {}).get('ref_role', 'Ref')
-        is_ref = any(r.name.lower() == ref_role.lower() for r in interaction.user.roles)
-        if not is_ref and not interaction.permissions.administrator:
-            await interaction.response.send_message(f"❌  You need the **{ref_role}** role.", ephemeral=True); return
-        if not screenshot.content_type or not screenshot.content_type.startswith('image/'):
-            await interaction.response.send_message("❌  Please attach an image screenshot.", ephemeral=True); return
-        match = next((m for m in gdata['matches'] if m['id'] == match_id), None)
-        if not match:
-            await interaction.response.send_message(f"❌  Match #{match_id} not found.", ephemeral=True); return
-        if match['status'] not in ('ongoing',):
-            await interaction.response.send_message(f"❌  Match #{match_id} is not ongoing (status: {match['status']}).", ephemeral=True); return
-        if winner_id not in (match['p1'], match['p2']):
-            await interaction.response.send_message("❌  Winner ID must be one of the two players.", ephemeral=True); return
-        loser_id = match['p2'] if winner_id == match['p1'] else match['p1']
-        w_p = gdata['players'].get(winner_id)
-        l_p = gdata['players'].get(loser_id)
-        if not w_p or not l_p:
-            await interaction.response.send_message("❌  Player data not found.", ephemeral=True); return
-        old_w, old_l = w_p['elo'], l_p['elo']
-        w_score = p1_score if winner_id == match['p1'] else p2_score
-        l_score = p2_score if winner_id == match['p1'] else p1_score
-        new_w, new_l, gained, lost = new_elos(old_w, old_l, w_score, l_score, True)
-        w_p['elo'] = new_w; w_p['wins'] += 1; w_p['kills'] += w_score; w_p['deaths'] += l_score
-        l_p['elo'] = max(100, new_l); l_p['losses'] += 1; l_p['kills'] += l_score; l_p['deaths'] += w_score
-        match.update({'status': 'score_confirmed', 'winner': winner_id, 'p1_score': p1_score, 'p2_score': p2_score,
-                      'confirmed_by': str(interaction.user.id), 'completed_at': datetime.now(timezone.utc).isoformat(),
-                      'elo_gained': gained, 'elo_lost': lost, 'screenshot_url': screenshot.url})
-        w_p['matches'].append(match_id); l_p['matches'].append(match_id)
-        ref_uid = match.get('ref_uid')
-        if ref_uid and ref_uid in gdata.get('active_refs', {}): del gdata['active_refs'][ref_uid]
-        save_guild(gid, gdata)
-        _, wr, we, wc = get_rank(new_w); _, lr, le, _ = get_rank(new_l)
-        embed = discord.Embed(title=f"✅  Match #{match_id} — Result Confirmed", colour=wc)
-        embed.add_field(name="🏆  Winner", value=f"<@{winner_id}>\n{we} {wr}\n{old_w} → **{new_w}** ELO (+{gained})", inline=True)
-        embed.add_field(name="💀  Loser",  value=f"<@{loser_id}>\n{le} {lr}\n{old_l} → **{new_l}** ELO (-{lost})", inline=True)
-        embed.add_field(name="📊  Score",  value=f"**{p1_score} — {p2_score}**", inline=False)
-        embed.set_image(url=screenshot.url)
-        embed.set_footer(text=f"Confirmed by {interaction.user.display_name}  •  Click 🔒 Close Game to finish")
-        embed.timestamp = datetime.now(timezone.utc)
-        await interaction.response.send_message(embed=embed)
-        log_ch_id = gdata.get('settings', {}).get('log_channel_id')
-        if log_ch_id:
-            try: await (await bot.fetch_channel(int(log_ch_id))).send(embed=embed)
-            except Exception: pass
-    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
-
-@bot.tree.command(name="rollback", description="Roll back last N matches for a player and their opponents (Admin only)")
-@app_commands.default_permissions(administrator=True)
-@app_commands.describe(user="Player to roll back", games="Number of recent games to reverse")
-async def cmd_rollback(interaction: discord.Interaction, user: discord.Member, games: int):
-    try:
-        if not interaction.permissions.administrator:
-            await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
-        gid, uid = str(interaction.guild_id), str(user.id)
-        gdata  = guild_data(gid)
-        player = get_player(gdata, uid)
-        if not player:
-            await interaction.response.send_message("❌  Player not registered.", ephemeral=True); return
-        completed = sorted(
-            [m for m in gdata['matches'] if m['status'] in ('completed', 'score_confirmed') and uid in (m['p1'], m['p2'])],
-            key=lambda x: x.get('completed_at', ''), reverse=True
-        )[:games]
-        if not completed:
-            await interaction.response.send_message("❌  No completed matches to roll back.", ephemeral=True); return
-
-        old_elo = player['elo']
-        rolled = []
-        affected_opponents = {}  # uid -> (old_elo, new_elo)
-
-        for m in completed:
-            opponent_uid = m['p2'] if m['p1'] == uid else m['p1']
-            opponent = gdata['players'].get(opponent_uid)
-
-            # Roll back the target player
-            if m['winner'] == uid:
-                player['elo'] -= m.get('elo_gained', 20); player['wins'] = max(0, player['wins'] - 1)
-                player['kills']  = max(0, player['kills']  - m.get('p1_score' if m['p1'] == uid else 'p2_score', 0))
-                player['deaths'] = max(0, player['deaths'] - m.get('p2_score' if m['p1'] == uid else 'p1_score', 0))
-            else:
-                player['elo'] += m.get('elo_lost', 20); player['losses'] = max(0, player['losses'] - 1)
-                player['kills']  = max(0, player['kills']  - m.get('p1_score' if m['p1'] == uid else 'p2_score', 0))
-                player['deaths'] = max(0, player['deaths'] - m.get('p2_score' if m['p1'] == uid else 'p1_score', 0))
-            player['elo'] = max(100, player['elo'])
-
-            # Roll back the opponent
-            if opponent:
-                opp_old = opponent_uid not in affected_opponents and opponent['elo']
-                if opponent_uid not in affected_opponents:
-                    affected_opponents[opponent_uid] = {'old_elo': opponent['elo']}
-                if m['winner'] == opponent_uid:
-                    opponent['elo'] -= m.get('elo_gained', 20); opponent['wins'] = max(0, opponent['wins'] - 1)
-                    opponent['kills']  = max(0, opponent['kills']  - m.get('p1_score' if m['p1'] == opponent_uid else 'p2_score', 0))
-                    opponent['deaths'] = max(0, opponent['deaths'] - m.get('p2_score' if m['p1'] == opponent_uid else 'p1_score', 0))
-                else:
-                    opponent['elo'] += m.get('elo_lost', 20); opponent['losses'] = max(0, opponent['losses'] - 1)
-                    opponent['kills']  = max(0, opponent['kills']  - m.get('p1_score' if m['p1'] == opponent_uid else 'p2_score', 0))
-                    opponent['deaths'] = max(0, opponent['deaths'] - m.get('p2_score' if m['p1'] == opponent_uid else 'p1_score', 0))
-                opponent['elo'] = max(100, opponent['elo'])
-                affected_opponents[opponent_uid]['new_elo'] = opponent['elo']
-
-            m['status'] = 'rolled_back'
-            rolled.append(m['id'])
-
-        save_guild(gid, gdata)
-        embed = discord.Embed(title="↩️  Rollback Complete", colour=discord.Colour.orange())
-        embed.add_field(name="Player",            value=f"<@{uid}>",                                                    inline=True)
-        embed.add_field(name="Games Rolled Back", value=f"**{len(rolled)}**  (#{', #'.join(str(x) for x in rolled)})", inline=True)
-        embed.add_field(name="ELO Change",        value=f"{old_elo} → **{player['elo']}**",                            inline=False)
-        if affected_opponents:
-            opp_lines = [f"<@{ouid}>: {v['old_elo']} → **{v['new_elo']}**" for ouid, v in affected_opponents.items()]
-            embed.add_field(name="Opponents Also Rolled Back", value="\n".join(opp_lines), inline=False)
-        await interaction.response.send_message(embed=embed)
-    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
-
-@bot.tree.command(name="adjust-elo", description="Add or remove ELO from a player (Admin only)")
-@app_commands.default_permissions(administrator=True)
-@app_commands.describe(user="The player", amount="Amount e.g. 50 or -50")
-async def cmd_adjust_elo(interaction: discord.Interaction, user: discord.Member, amount: int):
-    try:
-        if not interaction.permissions.administrator:
-            await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
-        gid, uid = str(interaction.guild_id), str(user.id)
-        gdata = guild_data(gid); player = get_player(gdata, uid)
-        if not player:
-            await interaction.response.send_message("❌  Player not registered.", ephemeral=True); return
-        old_elo = player['elo']; player['elo'] = max(100, player['elo'] + amount)
-        save_guild(gid, gdata)
-        _, rn, re_, colour = get_rank(player['elo'])
-        embed = discord.Embed(title="⚙️  ELO Adjusted", description=f"<@{uid}>\n{old_elo} → **{player['elo']}** ELO  ({'+' if amount >= 0 else ''}{amount})\n{re_} {rn}", colour=colour)
-        await interaction.response.send_message(embed=embed)
-    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
-
-@bot.tree.command(name="setup-queue", description="Set channel where match threads are created — run IN the channel (Admin only)")
-@app_commands.default_permissions(administrator=True)
-async def cmd_setup_queue(interaction: discord.Interaction):
-    try:
-        if not interaction.permissions.administrator:
-            await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
-        gid = str(interaction.guild_id); gdata = guild_data(gid)
-        gdata.setdefault('settings', {})['queue_channel_id'] = str(interaction.channel_id)
-        save_guild(gid, gdata)
-        await interaction.response.send_message(f"✅  Match threads will be created in <#{interaction.channel_id}>!", ephemeral=True)
-    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
-
-@bot.tree.command(name="setup-queue-vc", description="Set the single queue VC — join it first, then run this (Admin only)")
-@app_commands.default_permissions(administrator=True)
-async def cmd_setup_queue_vc(interaction: discord.Interaction):
-    try:
-        if not interaction.permissions.administrator:
-            await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
-        if not interaction.user.voice or not interaction.user.voice.channel:
-            await interaction.response.send_message("❌  Join the queue VC first, then run this!", ephemeral=True); return
-        gid = str(interaction.guild_id); gdata = guild_data(gid)
-        vc = interaction.user.voice.channel
-        gdata.setdefault('settings', {})['queue_vc_id'] = str(vc.id)
-        save_guild(gid, gdata)
-        await interaction.response.send_message(f"✅  **{vc.name}** is now the queue VC! Players will be assigned regions based on their **EU / NA / SA / AS / OCE** roles.", ephemeral=True)
-    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
-
-@bot.tree.command(name="setup-default-region", description="Set fallback region if player has no region role (Admin only)")
-@app_commands.default_permissions(administrator=True)
-@app_commands.describe(region="Default region")
-@app_commands.choices(region=[app_commands.Choice(name=r, value=r) for r in REGIONS])
-async def cmd_setup_default_region(interaction: discord.Interaction, region: str):
-    try:
-        if not interaction.permissions.administrator:
-            await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
-        gid = str(interaction.guild_id); gdata = guild_data(gid)
-        gdata.setdefault('settings', {})['default_region'] = region
-        save_guild(gid, gdata)
-        await interaction.response.send_message(f"✅  Default region set to **{region}**!", ephemeral=True)
-    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
-
-@bot.tree.command(name="setup-ref-role", description="Set the referee role name (Admin only)")
-@app_commands.default_permissions(administrator=True)
-@app_commands.describe(role_name="Exact name of the ref role")
-async def cmd_setup_ref_role(interaction: discord.Interaction, role_name: str):
-    try:
-        if not interaction.permissions.administrator:
-            await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
-        gid = str(interaction.guild_id); gdata = guild_data(gid)
-        gdata.setdefault('settings', {})['ref_role'] = role_name
-        save_guild(gid, gdata)
-        await interaction.response.send_message(f"✅  Ref role set to **{role_name}**!", ephemeral=True)
-    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
-
-@bot.tree.command(name="setup-vc-category", description="Set the category for match VCs — run in any channel in that category (Admin only)")
-@app_commands.default_permissions(administrator=True)
-async def cmd_setup_vc_category(interaction: discord.Interaction):
-    try:
-        if not interaction.permissions.administrator:
-            await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
-        if not interaction.channel.category:
-            await interaction.response.send_message("❌  This channel isn't in a category!", ephemeral=True); return
-        gid = str(interaction.guild_id); gdata = guild_data(gid)
-        gdata.setdefault('settings', {})['vc_category_id'] = str(interaction.channel.category.id)
-        save_guild(gid, gdata)
-        await interaction.response.send_message(f"✅  Match VCs will be created in **{interaction.channel.category.name}**!", ephemeral=True)
-    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
-
-@bot.tree.command(name="setup-log-channel", description="Set the match results log channel — run IN the channel (Admin only)")
-@app_commands.default_permissions(administrator=True)
-async def cmd_setup_log(interaction: discord.Interaction):
-    try:
-        if not interaction.permissions.administrator:
-            await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
-        gid = str(interaction.guild_id); gdata = guild_data(gid)
-        gdata.setdefault('settings', {})['log_channel_id'] = str(interaction.channel_id)
-        save_guild(gid, gdata)
-        await interaction.response.send_message(f"✅  Match results will be logged in <#{interaction.channel_id}>!", ephemeral=True)
-    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
-
-@bot.tree.command(name="post-ref-board", description="Post the ref availability board (Admin only)")
-@app_commands.default_permissions(administrator=True)
-async def cmd_post_ref_board(interaction: discord.Interaction):
-    try:
-        if not interaction.permissions.administrator:
-            await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
-        gid = str(interaction.guild_id); gdata = guild_data(gid)
-        msg = await interaction.channel.send(embed=build_ref_embed(gdata), view=RefBoardView())
-        gdata.setdefault('settings', {})['ref_message_id'] = str(msg.id)
-        gdata['settings']['ref_channel_id'] = str(interaction.channel_id)
-        save_guild(gid, gdata)
-        await interaction.response.send_message("✅  Ref board posted!", ephemeral=True)
-    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
-
-@bot.tree.command(name="post-leaderboard", description="Post a live leaderboard that updates every 5 minutes (Admin only)")
-@app_commands.default_permissions(administrator=True)
-async def cmd_post_leaderboard(interaction: discord.Interaction):
-    try:
-        if not interaction.permissions.administrator:
-            await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
-        gid = str(interaction.guild_id); gdata = guild_data(gid)
-        msg = await interaction.channel.send(embed=build_leaderboard_embed(gdata))
-        gdata.setdefault('settings', {})['lb_message_id'] = str(msg.id)
-        gdata['settings']['lb_channel_id'] = str(interaction.channel_id)
-        save_guild(gid, gdata)
-        await interaction.response.send_message("✅  Live leaderboard posted!", ephemeral=True)
-    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
-
-@bot.tree.command(name="setup-banner", description="Set a profile banner by uploading an image (Admin only)")
-@app_commands.default_permissions(administrator=True)
-@app_commands.describe(image="Upload the banner image directly")
-@app_commands.choices(slot=[app_commands.Choice(name=f"{i+1} - {n}", value=i+1) for i, n in enumerate(BANNER_NAMES)])
-async def cmd_setup_banner(interaction: discord.Interaction, slot: int, image: discord.Attachment):
-    try:
-        if not interaction.permissions.administrator:
-            await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
-        if not image.content_type or not image.content_type.startswith('image/'):
-            await interaction.response.send_message("❌  Please upload an image file.", ephemeral=True); return
-        gid = str(interaction.guild_id); gdata = guild_data(gid)
-        banners = gdata.setdefault('settings', {}).setdefault('banners', [''] * 6)
-        while len(banners) < 6: banners.append('')
-        banners[slot - 1] = image.url
-        gdata['settings']['banners'] = banners
-        save_guild(gid, gdata)
-        await interaction.response.send_message(f"✅  Banner **{BANNER_NAMES[slot-1]}** set!", ephemeral=True)
-    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
-
-@bot.tree.command(name="reset-elo", description="Reset a player's ELO to 500 (Admin only)")
-@app_commands.default_permissions(administrator=True)
-@app_commands.describe(user="The player to reset")
-async def cmd_reset_elo(interaction: discord.Interaction, user: discord.Member):
-    try:
-        if not interaction.permissions.administrator:
-            await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
-        gid, uid = str(interaction.guild_id), str(user.id)
-        gdata = guild_data(gid)
-        if uid not in gdata['players']:
-            await interaction.response.send_message("❌  Player not registered.", ephemeral=True); return
-        gdata['players'][uid]['elo'] = 500; save_guild(gid, gdata)
-        await interaction.response.send_message(f"✅  Reset **{user.display_name}**'s ELO to 500.", ephemeral=True)
-    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
-
-@bot.tree.command(name="unregister", description="Remove a player from the system (Admin only)")
-@app_commands.default_permissions(administrator=True)
-@app_commands.describe(user="The player to remove")
-async def cmd_unregister(interaction: discord.Interaction, user: discord.Member):
-    try:
-        if not interaction.permissions.administrator:
-            await interaction.response.send_message("❌  Admins only.", ephemeral=True); return
-        gid, uid = str(interaction.guild_id), str(user.id)
-        gdata = guild_data(gid)
-        if uid not in gdata['players']:
-            await interaction.response.send_message("❌  Player not registered.", ephemeral=True); return
-        del gdata['players'][uid]
-        gdata['queue'] = [q for q in gdata['queue'] if q['uid'] != uid]
-        save_guild(gid, gdata)
-        await interaction.response.send_message(f"✅  **{user.display_name}** has been removed.", ephemeral=True)
-    except Exception as e: await interaction.response.send_message(f"❌  {e}", ephemeral=True)
+        await interaction.channel.send(embed=embed)
+        await interaction.response.send_message("✅  Schedule posted!", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌  {e}", ephemeral=True)
 
 if __name__ == '__main__':
     if not TOKEN: raise ValueError("DISCORD_TOKEN not set!")
